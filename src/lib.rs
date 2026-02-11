@@ -85,7 +85,28 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn join_circle(env: Env, user: Address, circle_id: u64) {
-        // TODO: Logic to add user to members list
+        // 1. Authorization: The user MUST sign this transaction
+        user.require_auth();
+
+        // 2. Retrieve the circle data
+        // We use 'unwrap()' here effectively saying "If this ID doesn't exist, fail immediately"
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+
+        // 3. Check if the circle is full
+        if circle.members.len() >= circle.max_members {
+            panic!("Circle is full");
+        }
+
+        // 4. Check if user is already a member to prevent duplicates
+        if circle.members.contains(&user) {
+            panic!("User is already a member");
+        }
+
+        // 5. Add the user to the list
+        circle.members.push_back(user.clone());
+
+        // 6. Save the updated circle back to storage
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
     fn deposit(env: Env, user: Address, circle_id: u64) {
