@@ -87,6 +87,8 @@ const MEMBERS_KEY: Symbol = symbol_short!("members");
 const CONTRIBS_KEY: Symbol = symbol_short!("contribs");
 const IS_PUBLIC_KEY: Symbol = symbol_short!("is_pub");
 const INVITE_CODE_KEY: Symbol = symbol_short!("inv_code");
+const MEMBERS_COUNT_KEY: Symbol = symbol_short!("m_count");
+const MAX_MEMBERS: u32 = 50;
 const MAX_BASIS_POINTS: u32 = 10_000;
 
 contractmeta!(
@@ -107,6 +109,7 @@ pub enum Error {
     MemberNotFound = 1007,
     PenaltyExceedsContribution = 1008,
     InvalidInvite = 1009,
+    MemberLimitExceeded = 1010,
 }
 
 #[contractimpl]
@@ -252,6 +255,55 @@ impl SorosusuContracts {
         Ok(())
     }
 
+    /// [Feature] "Public" vs "Private" Groups and Member Limits
+    /// Join the circle
+    pub fn join(env: Env, member: Address, invite_code: Option<u64>) -> Result<(), Error> {
+        member.require_auth();
+
+        let mut count: u32 = env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0);
+        if count >= MAX_MEMBERS {
+            return Err(Error::MemberLimitExceeded);
+        }
+
+        let mut members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap_or(Vec::new(&env));
+        if members.contains(&member) {
+            return Err(Error::AlreadyJoined);
+        }
+
+        let is_public: bool = env.storage().instance().get(&IS_PUBLIC_KEY).unwrap_or(true);
+
+        if !is_public {
+            let mut authorized_by_code = false;
+            if let Some(code) = invite_code {
+                if let Some(expected_code) = env.storage().instance().get::<_, u64>(&INVITE_CODE_KEY) {
+                    if code == expected_code {
+                        authorized_by_code = true;
+                    }
+                }
+            }
+            if !authorized_by_code {
+                Self::require_admin(&env)?;
+            }
+        }
+
+        members.push_back(member.clone());
+        env.storage().instance().set(&MEMBERS_KEY, &members);
+
+        count += 1;
+        env.storage().instance().set(&MEMBERS_COUNT_KEY, &count);
+
+        let mut contribs: Map<Address, i128> = env.storage().instance().get(&CONTRIBS_KEY).unwrap_or(Map::new(&env));
+        contribs.set(member, 0);
+        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
+
+        Ok(())
+    }
+
+    /// Get current member count.
+    pub fn member_count(env: Env) -> u32 {
+        env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0)
+    }
+
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -278,43 +330,6 @@ impl SorosusuContracts {
         } else {
             env.storage().instance().remove(&INVITE_CODE_KEY);
         }
-        Ok(())
-    }
-
-    /// [Feature] "Public" vs "Private" Groups
-    /// Join the circle
-    pub fn join(env: Env, member: Address, invite_code: Option<u64>) -> Result<(), Error> {
-        member.require_auth();
-
-        let mut members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap_or(Vec::new(&env));
-        
-        if members.contains(&member) {
-            return Err(Error::AlreadyJoined);
-        }
-
-        let is_public: bool = env.storage().instance().get(&IS_PUBLIC_KEY).unwrap_or(true);
-
-        if !is_public {
-            let mut authorized_by_code = false;
-            if let Some(code) = invite_code {
-                if let Some(expected_code) = env.storage().instance().get::<_, u64>(&INVITE_CODE_KEY) {
-                    if code == expected_code {
-                        authorized_by_code = true;
-                    }
-                }
-            }
-            if !authorized_by_code {
-                Self::require_admin(&env)?;
-            }
-        }
-
-        members.push_back(member.clone());
-        env.storage().instance().set(&MEMBERS_KEY, &members);
-
-        let mut contribs: Map<Address, i128> = env.storage().instance().get(&CONTRIBS_KEY).unwrap_or(Map::new(&env));
-        contribs.set(member, 0);
-        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
-
         Ok(())
     }
 }
@@ -490,5 +505,29 @@ mod test {
 
         let member = Address::generate(&env);
         client.join(&member, &None);
+    }
+
+    #[test]
+    fn test_member_limit_boundary() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        client.initialize(&admin);
+
+        env.mock_all_auths();
+
+        // Join 50 members
+        for _ in 0..50 {
+            let user = Address::generate(&env);
+            client.join(&user, &None);
+        }
+
+        assert_eq!(client.member_count(), 50);
+
+        // 51st member should fail
+        let user_51 = Address::generate(&env);
+        let result = client.try_join(&user_51, &None);
+        
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().unwrap(), Error::MemberLimitExceeded);
     }
 }
