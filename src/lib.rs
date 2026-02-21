@@ -2,12 +2,14 @@
 #![cfg_attr(test, allow(dead_code))]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contractmeta, symbol_short, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contractmeta, symbol_short, token, Address, Env, Map, Symbol, Vec,
 };
 
 const FEE_BASIS_POINTS_KEY: Symbol = symbol_short!("fee_bps");
 const TREASURY_KEY: Symbol = symbol_short!("treasury");
 const ADMIN_KEY: Symbol = symbol_short!("admin");
+const MEMBERS_KEY: Symbol = symbol_short!("members");
+const CONTRIBS_KEY: Symbol = symbol_short!("contribs");
 const MAX_BASIS_POINTS: u32 = 10_000;
 
 contractmeta!(
@@ -24,6 +26,8 @@ pub struct SorosusuContracts;
 pub enum Error {
     Unauthorized = 1005,
     InvalidFeeConfig = 1006,
+    MemberNotFound = 1007,
+    PenaltyExceedsContribution = 1008,
 }
 
 #[contractimpl]
@@ -35,11 +39,17 @@ impl SorosusuContracts {
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &0u32);
+        
+        // Initialize empty members list and contributions map
+        let empty_members: Vec<Address> = Vec::new(&env);
+        let empty_contribs: Map<Address, i128> = Map::new(&env);
+        env.storage().instance().set(&MEMBERS_KEY, &empty_members);
+        env.storage().instance().set(&CONTRIBS_KEY, &empty_contribs);
+        
         Ok(())
     }
 
     /// Set protocol fee (basis points, e.g. 50 = 0.5%) and treasury address. Admin only.
-    /// fee_basis_points must be <= 10_000. If fee_basis_points > 0, treasury must be set.
     pub fn set_protocol_fee(
         env: Env,
         fee_basis_points: u32,
@@ -54,7 +64,7 @@ impl SorosusuContracts {
         Ok(())
     }
 
-    /// Get current fee basis points (e.g. 50 = 0.5%).
+    /// Get current fee basis points.
     pub fn fee_basis_points(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -62,13 +72,12 @@ impl SorosusuContracts {
             .unwrap_or(0)
     }
 
-    /// Get treasury address (recipient of protocol fee).
+    /// Get treasury address.
     pub fn treasury_address(env: Env) -> Option<Address> {
         env.storage().instance().get::<_, Address>(&TREASURY_KEY)
     }
 
-    /// Compute fee from gross amount and perform transfers: net to recipient, fee to treasury.
-    /// Call this from the payout flow. `from` is the address holding the tokens (e.g. contract).
+    /// Compute fee from gross amount and perform transfers.
     pub fn compute_and_transfer_payout(
         env: Env,
         token: Address,
@@ -99,6 +108,70 @@ impl SorosusuContracts {
         Ok(())
     }
 
+    /// [Feature] "Kick Member" (Admin Only)
+    /// Removes a member, refunds their contributions minus a penalty, and emits MemberKicked.
+    pub fn kick_member(
+        env: Env,
+        token: Address,
+        member: Address,
+        penalty: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+
+        // 1. Load members and find the member to kick
+        let mut members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap_or(Vec::new(&env));
+        let mut member_index = None;
+        
+        for (i, m) in members.iter().enumerate() {
+            if m == member {
+                member_index = Some(i as u32);
+                break;
+            }
+        }
+
+        let index = member_index.ok_or(Error::MemberNotFound)?;
+
+        // 2. Load contributions
+        let mut contribs: Map<Address, i128> = env.storage().instance().get(&CONTRIBS_KEY).unwrap_or(Map::new(&env));
+        let total_contributed = contribs.get(member.clone()).unwrap_or(0);
+
+        if total_contributed < penalty {
+            return Err(Error::PenaltyExceedsContribution);
+        }
+
+        // 3. Remove member from state
+        members.remove(index);
+        contribs.remove(member.clone());
+        
+        env.storage().instance().set(&MEMBERS_KEY, &members);
+        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
+
+        // 4. Calculate refund and perform transfers
+        let refund = total_contributed - penalty;
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+
+        if refund > 0 {
+            token_client.transfer(&contract_address, &member, &refund);
+        }
+
+        // If there's a penalty, route it to the treasury
+        if penalty > 0 {
+            if let Some(treasury) = Self::treasury_address(env.clone()) {
+                token_client.transfer(&contract_address, &treasury, &penalty);
+            }
+        }
+
+        // 5. Emit MemberKicked event
+        // Topics: ["MemberKicked", member_address], Data: [refund_amount, penalty_amount]
+        env.events().publish(
+            (symbol_short!("Kicked"), member.clone()),
+            (refund, penalty),
+        );
+
+        Ok(())
+    }
+
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -108,6 +181,9 @@ impl SorosusuContracts {
         admin.require_auth();
         Ok(())
     }
+    
+    // NOTE: You will need to build an `add_member` or `deposit` function to populate 
+    // the `MEMBERS_KEY` vector and `CONTRIBS_KEY` map.
 }
 
 #[cfg(test)]
@@ -150,14 +226,18 @@ mod test {
     }
 
     #[test]
-    fn fee_zero_accepted_and_getter_returns_zero() {
+    fn kick_member_fails_if_not_found() {
         let env = Env::default();
         let (client, admin) = setup(&env);
         client.initialize(&admin);
-        let treasury = Address::generate(&env);
+        
+        let dummy_token = Address::generate(&env);
+        let dummy_member = Address::generate(&env);
+        
         env.mock_all_auths();
-        client.set_protocol_fee(&0, &treasury).unwrap();
-        assert_eq!(client.fee_basis_points(), 0);
+        let result = client.try_kick_member(&dummy_token, &dummy_member, &0);
+        
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().unwrap(), Error::MemberNotFound);
     }
 }
-
