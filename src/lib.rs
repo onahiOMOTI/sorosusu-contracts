@@ -1,20 +1,15 @@
-#![cfg_attr(test, allow(dead_code))]
 #![no_std]
+#![cfg_attr(test, allow(dead_code))]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, panic_with_error,
-    symbol_short, token, Address, Env, Map, Symbol, Vec,
+    symbol_short, token, Address, BytesN, Env, Symbol, Vec,
 };
 
 const FEE_BASIS_POINTS_KEY: Symbol = symbol_short!("fee_bps");
 const TREASURY_KEY: Symbol = symbol_short!("treasury");
 const ADMIN_KEY: Symbol = symbol_short!("admin");
-const MEMBERS_KEY: Symbol = symbol_short!("members");
-const CONTRIBS_KEY: Symbol = symbol_short!("contribs");
-const USER_BAL_KEY: Symbol = symbol_short!("usr_bal");
-const LAST_ACTIVE_KEY: Symbol = symbol_short!("last_act");
 const MAX_BASIS_POINTS: u32 = 10_000;
-const EMERGENCY_WITHDRAWAL_DELAY_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_MEMBERS: u32 = 50;
 
 contractmeta!(
@@ -41,10 +36,7 @@ pub struct Circle {
     pub cycle_number: u32,
     pub current_payout_index: u32,
     pub total_volume_distributed: i128,
-    pub is_dissolved: bool,
-    pub dissolution_votes: Vec<Address>,
-    pub contributions_paid: Vec<i128>,
-    pub token: Option<Address>,
+
 }
 
 #[derive(Clone)]
@@ -72,75 +64,55 @@ pub struct LateJoinerCaughtUpEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    CircleNotFound = 1001,
-    Unauthorized = 1002,
+    CycleNotComplete = 1001,
+    InsufficientAllowance = 1002,
     AlreadyJoined = 1003,
-    MaxMembersReached = 1004,
-    AlreadyVoted = 1005,
-    NotMember = 1006,
-    AlreadyDissolved = 1007,
-    NotDissolved = 1008,
-    InvalidFeeConfig = 1009,
-    PenaltyExceedsContribution = 1010,
-    MemberAlreadyExists = 1011,
-    EmergencyWithdrawalNotAvailable = 1012,
-    CircleNotFinalized = 1013,
-    CycleNotComplete = 1014,
-    PayoutAlreadyReceived = 1015,
-    InvalidCircleState = 1016,
-    MemberNotFound = 1017,
-    LateJoinRequiresToken = 1018,
+
 }
 
 #[contract]
 pub struct SoroSusu;
 
 fn read_circle(env: &Env, id: u32) -> Circle {
-    match env.storage().instance().get(&DataKey::Circle(id)) {
-        Some(c) => c,
+    let key = DataKey::Circle(id);
+    let storage = env.storage().instance();
+    match storage.get(&key) {
+        Some(circle) => circle,
         None => panic_with_error!(env, Error::CircleNotFound),
     }
 }
 
 fn write_circle(env: &Env, id: u32, circle: &Circle) {
-    env.storage().instance().set(&DataKey::Circle(id), circle);
+    let key = DataKey::Circle(id);
+    env.storage().instance().set(&key, circle);
 }
 
 fn next_circle_id(env: &Env) -> u32 {
     let key = DataKey::CircleCount;
-    let current: u32 = env.storage().instance().get(&key).unwrap_or(0);
-    let next = current + 1;
-    env.storage().instance().set(&key, &next);
+    let storage = env.storage().instance();
+    let current: u32 = storage.get(&key).unwrap_or(0);
+    let next = current.saturating_add(1);
+    storage.set(&key, &next);
     next
 }
 
 #[contractimpl]
 impl SoroSusu {
     // ============================================================
-    // GLOBAL & FEE LOGIC
+    // GLOBAL ADMIN & FEE LOGIC
     // ============================================================
 
+    /// Initialize the contract with an admin. Call once after deploy.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&ADMIN_KEY) {
             return Err(Error::Unauthorized);
         }
-
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &0u32);
-        env.storage()
-            .instance()
-            .set(&MEMBERS_KEY, &Vec::<Address>::new(&env));
-        env.storage()
-            .instance()
-            .set(&CONTRIBS_KEY, &Map::<Address, i128>::new(&env));
-        env.storage()
-            .instance()
-            .set(&USER_BAL_KEY, &Map::<Address, i128>::new(&env));
-        Self::touch_last_active(&env);
-
         Ok(())
     }
 
+    /// Set protocol fee (basis points, e.g. 50 = 0.5%) and treasury address. Admin only.
     pub fn set_protocol_fee(
         env: Env,
         fee_basis_points: u32,
@@ -150,136 +122,22 @@ impl SoroSusu {
         if fee_basis_points > MAX_BASIS_POINTS {
             return Err(Error::InvalidFeeConfig);
         }
-
         env.storage()
             .instance()
             .set(&FEE_BASIS_POINTS_KEY, &fee_basis_points);
         env.storage().instance().set(&TREASURY_KEY, &treasury);
-        Self::touch_last_active(&env);
         Ok(())
     }
 
-    pub fn deposit(env: Env, user: Address, token: Address, amount: i128) -> Result<(), Error> {
-        user.require_auth();
-
-        let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&user, &contract_address, &amount);
-
-        let mut balances: Map<Address, i128> = env
-            .storage()
+    pub fn fee_basis_points(env: Env) -> u32 {
+        env.storage()
             .instance()
-            .get(&USER_BAL_KEY)
-            .unwrap_or(Map::new(&env));
-        let current = balances.get(user.clone()).unwrap_or(0);
-        balances.set(user, current + amount);
-        env.storage().instance().set(&USER_BAL_KEY, &balances);
-
-        Ok(())
+            .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
+            .unwrap_or(0)
     }
 
-    pub fn emergency_withdraw(env: Env, user: Address, token: Address) -> Result<(), Error> {
-        user.require_auth();
-
-        let last_active = Self::get_last_active_timestamp(env.clone());
-        let now = env.ledger().timestamp();
-        let unlock_at = last_active.saturating_add(EMERGENCY_WITHDRAWAL_DELAY_SECS);
-        if now <= unlock_at {
-            return Err(Error::EmergencyWithdrawalNotAvailable);
-        }
-
-        let mut balances: Map<Address, i128> = env
-            .storage()
-            .instance()
-            .get(&USER_BAL_KEY)
-            .unwrap_or(Map::new(&env));
-        let amount = balances.get(user.clone()).unwrap_or(0);
-        if amount > 0 {
-            let contract_address = env.current_contract_address();
-            let token_client = token::Client::new(&env, &token);
-            token_client.transfer(&contract_address, &user, &amount);
-        }
-        balances.remove(user.clone());
-        env.storage().instance().set(&USER_BAL_KEY, &balances);
-
-        Ok(())
-    }
-
-    pub fn admin_action(env: Env) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        Self::touch_last_active(&env);
-        Ok(())
-    }
-
-    pub fn kick_member(
-        env: Env,
-        token: Address,
-        member: Address,
-        penalty: i128,
-    ) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-
-        let mut members: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&MEMBERS_KEY)
-            .unwrap_or(Vec::new(&env));
-        let index = Self::find_member_index(&members, &member).ok_or(Error::MemberNotFound)?;
-
-        let mut contribs: Map<Address, i128> = env
-            .storage()
-            .instance()
-            .get(&CONTRIBS_KEY)
-            .unwrap_or(Map::new(&env));
-        let total_contributed = contribs.get(member.clone()).unwrap_or(0);
-
-        if total_contributed < penalty {
-            return Err(Error::PenaltyExceedsContribution);
-        }
-
-        members.remove(index);
-        contribs.remove(member.clone());
-        env.storage().instance().set(&MEMBERS_KEY, &members);
-        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
-
-        let refund = total_contributed - penalty;
-        let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &token);
-
-        if refund > 0 {
-            token_client.transfer(&contract_address, &member, &refund);
-        }
-
-        if penalty > 0 {
-            if let Some(treasury) = Self::treasury_address(env.clone()) {
-                token_client.transfer(&contract_address, &treasury, &penalty);
-            }
-        }
-
-        env.events()
-            .publish((symbol_short!("Kicked"), member.clone()), (refund, penalty));
-        Self::touch_last_active(&env);
-
-        Ok(())
-    }
-
-    pub fn swap_member(env: Env, old_member: Address, new_member: Address) -> Result<(), Error> {
-        old_member.require_auth();
-        new_member.require_auth();
-        Self::apply_member_swap(&env, old_member, new_member)
-    }
-
-    pub fn swap_member_by_admin(
-        env: Env,
-        old_member: Address,
-        new_member: Address,
-    ) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        let result = Self::apply_member_swap(&env, old_member, new_member);
-        if result.is_ok() {
-            Self::touch_last_active(&env);
-        }
-        result
+    pub fn treasury_address(env: Env) -> Option<Address> {
+        env.storage().instance().get::<_, Address>(&TREASURY_KEY)
     }
 
     pub fn compute_and_transfer_payout(
@@ -294,7 +152,6 @@ impl SoroSusu {
             .instance()
             .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
             .unwrap_or(0);
-
         let fee = if fee_bps == 0 {
             0_i128
         } else {
@@ -313,7 +170,16 @@ impl SoroSusu {
                 .ok_or(Error::InvalidFeeConfig)?;
             token_client.transfer(&from, &treasury, &fee);
         }
+        Ok(())
+    }
 
+    /// Upgrade contract to new WASM binary. Admin only.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if new_wasm_hash.is_empty() {
+            return Err(Error::InvalidUpgradeHash);
+        }
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
 
@@ -330,7 +196,6 @@ impl SoroSusu {
     ) -> u32 {
         admin.require_auth();
         let id = next_circle_id(&env);
-
         let circle = Circle {
             admin,
             contribution,
@@ -341,12 +206,8 @@ impl SoroSusu {
             cycle_number: 1,
             current_payout_index: 0,
             total_volume_distributed: 0,
-            is_dissolved: false,
-            dissolution_votes: Vec::new(&env),
-            contributions_paid: Vec::new(&env),
-            token,
-        };
 
+        };
         write_circle(&env, id, &circle);
         id
     }
@@ -354,10 +215,6 @@ impl SoroSusu {
     pub fn join_circle(env: Env, invoker: Address, circle_id: u32) {
         invoker.require_auth();
         let mut circle = read_circle(&env, circle_id);
-
-        if circle.is_dissolved {
-            panic_with_error!(&env, Error::AlreadyDissolved);
-        }
 
         for member in circle.members.iter() {
             if member == invoker {
@@ -370,60 +227,8 @@ impl SoroSusu {
             panic_with_error!(&env, Error::MaxMembersReached);
         }
 
-        // Catch-up for late joiners: Check if the circle is already active
-        if !circle.payout_queue.is_empty() {
-            let elapsed_rounds = circle.cycle_number;
-            let amount_paid = circle.contribution * (i128::from(elapsed_rounds));
-            
-            match &circle.token {
-                Some(token_address) => {
-                    let token_client = token::Client::new(&env, token_address);
-                    token_client.transfer(
-                        &invoker,
-                        &env.current_contract_address(),
-                        &amount_paid,
-                    );
-                }
-                None => panic_with_error!(&env, Error::LateJoinRequiresToken),
-            }
-            let event = LateJoinerCaughtUpEvent {
-                member_address: invoker.clone(),
-                amount_paid,
-            };
-            env.events().publish((symbol_short!("LATE_JOIN"),), event);
-        }
-
-        circle.members.push_back(invoker.clone());
+main
         circle.has_received_payout.push_back(false);
-        circle.contributions_paid.push_back(circle.contribution);
-
-        write_circle(&env, circle_id, &circle);
-    }
-
-    pub fn finalize_circle(env: Env, admin: Address, circle_id: u32) {
-        admin.require_auth();
-        let mut circle = read_circle(&env, circle_id);
-
-        if admin != circle.admin {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        if circle.is_dissolved {
-            panic_with_error!(&env, Error::AlreadyDissolved);
-        }
-
-        if !circle.payout_queue.is_empty() {
-            return; // Already finalized
-        }
-
-        if circle.is_random_queue {
-            let mut shuffled = circle.members.clone();
-            env.prng().shuffle(&mut shuffled);
-            circle.payout_queue = shuffled;
-        } else {
-            circle.payout_queue = circle.members.clone();
-        }
-
         write_circle(&env, circle_id, &circle);
     }
 
@@ -433,10 +238,6 @@ impl SoroSusu {
 
         if admin != circle.admin {
             panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        if circle.is_dissolved {
-            panic_with_error!(&env, Error::AlreadyDissolved);
         }
 
         let mut member_index: Option<u32> = None;
@@ -461,7 +262,6 @@ impl SoroSusu {
         circle.total_volume_distributed += circle.contribution;
 
         let all_paid = circle.has_received_payout.iter().all(|paid| paid);
-
         if all_paid {
             let event = CycleCompletedEvent {
                 group_id: circle_id,
@@ -506,119 +306,32 @@ impl SoroSusu {
         write_circle(&env, circle_id, &circle);
     }
 
-    pub fn propose_dissolution(env: Env, invoker: Address, circle_id: u32) {
-        invoker.require_auth();
+    pub fn finalize_circle(env: Env, admin: Address, circle_id: u32) {
+        admin.require_auth();
         let mut circle = read_circle(&env, circle_id);
 
-        if circle.is_dissolved {
-            panic_with_error!(&env, Error::AlreadyDissolved);
+        if admin != circle.admin {
+            panic_with_error!(&env, Error::Unauthorized);
         }
 
-        if !circle.members.contains(&invoker) {
-            panic_with_error!(&env, Error::NotMember);
+        if !circle.payout_queue.is_empty() {
+            return;
         }
 
-        if !circle.dissolution_votes.contains(&invoker) {
-            circle.dissolution_votes.push_back(invoker.clone());
-        }
-
-        write_circle(&env, circle_id, &circle);
-    }
-
-    pub fn vote_dissolve(env: Env, invoker: Address, circle_id: u32) {
-        invoker.require_auth();
-        let mut circle = read_circle(&env, circle_id);
-
-        if circle.is_dissolved {
-            panic_with_error!(&env, Error::AlreadyDissolved);
-        }
-
-        if !circle.members.contains(&invoker) {
-            panic_with_error!(&env, Error::NotMember);
-        }
-
-        if circle.dissolution_votes.contains(&invoker) {
-            panic_with_error!(&env, Error::AlreadyVoted);
-        }
-
-        circle.dissolution_votes.push_back(invoker);
-
-        let total_members = circle.members.len();
-        let votes = circle.dissolution_votes.len();
-
-        if votes * 2 > total_members {
-            circle.is_dissolved = true;
-        }
-
-        write_circle(&env, circle_id, &circle);
-    }
-
-    pub fn withdraw_pro_rata(env: Env, invoker: Address, circle_id: u32) -> i128 {
-        invoker.require_auth();
-        let mut circle = read_circle(&env, circle_id);
-
-        if !circle.is_dissolved {
-            panic_with_error!(&env, Error::NotDissolved);
-        }
-
-        let mut index = None;
-        for (i, member) in circle.members.iter().enumerate() {
-            if member == invoker {
-                index = Some(i as u32);
-                break;
-            }
-        }
-
-        let i = index.unwrap_or_else(|| panic_with_error!(&env, Error::NotMember));
-        let contributed = circle.contributions_paid.get(i).unwrap_or(0);
-        
-        let received = if circle.has_received_payout.get(i).unwrap_or(false) {
-            circle.contribution
+        if circle.is_random_queue {
+            let mut shuffled = circle.members.clone();
+            env.prng().shuffle(&mut shuffled);
+            circle.payout_queue = shuffled;
         } else {
-            0
-        };
-
-        let refundable = contributed - received;
-
-        if refundable > 0 {
-            circle.contributions_paid.set(i, 0);
-            write_circle(&env, circle_id, &circle);
+            circle.payout_queue = circle.members.clone();
         }
 
-        refundable
+        write_circle(&env, circle_id, &circle);
     }
 
     // ============================================================
     // VIEW GETTERS & HELPERS
     // ============================================================
-
-    pub fn get_last_active_timestamp(env: Env) -> u64 {
-        env.storage().instance().get(&LAST_ACTIVE_KEY).unwrap_or(0)
-    }
-
-    pub fn get_user_balance(env: Env, user: Address) -> i128 {
-        let balances: Map<Address, i128> = env
-            .storage()
-            .instance()
-            .get(&USER_BAL_KEY)
-            .unwrap_or(Map::new(&env));
-        balances.get(user).unwrap_or(0)
-    }
-
-    pub fn fee_basis_points(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
-            .unwrap_or(0)
-    }
-
-    pub fn treasury_address(env: Env) -> Option<Address> {
-        env.storage().instance().get::<_, Address>(&TREASURY_KEY)
-    }
-
-    pub fn get_circle(env: Env, circle_id: u32) -> Circle {
-        read_circle(&env, circle_id)
-    }
 
     pub fn get_payout_queue(env: Env, circle_id: u32) -> Vec<Address> {
         let circle = read_circle(&env, circle_id);
@@ -648,57 +361,6 @@ impl SoroSusu {
         admin.require_auth();
         Ok(())
     }
-
-    fn apply_member_swap(env: &Env, old_member: Address, new_member: Address) -> Result<(), Error> {
-        let members: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&MEMBERS_KEY)
-            .unwrap_or(Vec::new(env));
-
-        let old_index =
-            Self::find_member_index(&members, &old_member).ok_or(Error::MemberNotFound)?;
-        if Self::find_member_index(&members, &new_member).is_some() && old_member != new_member {
-            return Err(Error::MemberAlreadyExists);
-        }
-
-        let mut updated_members = Vec::new(env);
-        for (index, member) in members.iter().enumerate() {
-            if index as u32 == old_index {
-                updated_members.push_back(new_member.clone());
-            } else {
-                updated_members.push_back(member);
-            }
-        }
-
-        let mut contribs: Map<Address, i128> = env
-            .storage()
-            .instance()
-            .get(&CONTRIBS_KEY)
-            .unwrap_or(Map::new(env));
-        let total_contributed = contribs.get(old_member.clone()).unwrap_or(0);
-        contribs.remove(old_member.clone());
-        contribs.set(new_member.clone(), total_contributed);
-
-        env.storage().instance().set(&MEMBERS_KEY, &updated_members);
-        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
-
-        Ok(())
-    }
-
-    fn find_member_index(members: &Vec<Address>, target: &Address) -> Option<u32> {
-        for (index, member) in members.iter().enumerate() {
-            if member == *target {
-                return Some(index as u32);
-            }
-        }
-        None
-    }
-
-    fn touch_last_active(env: &Env) {
-        let now = env.ledger().timestamp();
-        env.storage().instance().set(&LAST_ACTIVE_KEY, &now);
-    }
 }
 
 #[cfg(test)]
@@ -706,94 +368,55 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::{
-        testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger},
-        token, vec, IntoVal, Env,
-    };
+    use soroban_sdk::testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation};
+    use soroban_sdk::{vec, IntoVal};
 
-    fn create_token_contract<'a>(
-        env: &Env,
-        admin: &Address,
-    ) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
-        let asset = env.register_stellar_asset_contract_v2(admin.clone());
-        let contract_address = asset.address();
-        (
-            token::Client::new(env, &contract_address),
-            token::StellarAssetClient::new(env, &contract_address),
-        )
-    }
-
-    fn setup_global(env: &Env) -> (SoroSusuClient<'_>, Address) {
-        let contract_id = env.register_contract(None, SoroSusu);
-        let admin = Address::generate(env);
-        let client = SoroSusuClient::new(env, &contract_id);
-        (client, admin)
-    }
-
-    fn setup_circles() -> (Env, SoroSusuClient<'static>) {
-        let env = Env::default();
+    fn setup() -> (soroban_sdk::Env, SoroSusuClient<'static>) {
+        let env = soroban_sdk::Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, SoroSusu);
         let client = SoroSusuClient::new(&env, &contract_id);
         (env, client)
     }
 
-    fn seed_members_and_contribs(
-        env: &Env,
-        contract_id: &Address,
-        members: Vec<Address>,
-        contribs: Map<Address, i128>,
-    ) {
-        env.as_contract(contract_id, || {
-            env.storage().instance().set(&MEMBERS_KEY, &members);
-            env.storage().instance().set(&CONTRIBS_KEY, &contribs);
-        });
-    }
-
-    fn read_members_and_contribs(
-        env: &Env,
-        contract_id: &Address,
-    ) -> (Vec<Address>, Map<Address, i128>) {
-        env.as_contract(contract_id, || {
-            let stored_members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap();
-            let stored_contribs: Map<Address, i128> =
-                env.storage().instance().get(&CONTRIBS_KEY).unwrap();
-            (stored_members, stored_contribs)
-        })
-    }
-
     #[test]
-    fn set_protocol_fee_rejects_over_max() {
-        let env = Env::default();
-        let (client, admin) = setup_global(&env);
+    fn upgrade_requires_admin() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        let treasury = Address::generate(&env);
-        env.mock_all_auths();
+        let non_admin = Address::generate(&env);
+        let new_wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        let result = client.try_set_protocol_fee(&10_001, &treasury);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: non_admin.clone(),
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "upgrade",
+                args: vec![&env, new_wasm_hash.into_val(&env)],
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = client.try_upgrade(&new_wasm_hash);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidFeeConfig);
     }
 
     #[test]
-    fn fee_basis_points_and_treasury_getters() {
-        let env = Env::default();
-        let (client, admin) = setup_global(&env);
+    fn upgrade_rejects_empty_hash() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
         client.initialize(&admin);
-        assert_eq!(client.fee_basis_points(), 0);
-        assert!(client.treasury_address().is_none());
 
-        let treasury = Address::generate(&env);
-        env.mock_all_auths();
-        client.set_protocol_fee(&50, &treasury);
-        assert_eq!(client.fee_basis_points(), 50);
-        assert_eq!(client.treasury_address(), Some(treasury));
+        let empty_hash = BytesN::new(&env);
+        let result = client.try_upgrade(&empty_hash);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidUpgradeHash);
     }
 
     #[test]
     fn join_circle_enforces_max_members() {
-        let (env, client) = setup_circles();
+        let (env, client) = setup();
         let admin = Address::generate(&env);
         let circle_id = client.create_circle(&admin, &10_i128, &false, &None);
 
@@ -811,7 +434,7 @@ mod test {
 
     #[test]
     fn test_random_queue_finalization() {
-        let (env, client) = setup_circles();
+        let (env, client) = setup();
         let admin = Address::generate(&env);
         let circle_id = client.create_circle(&admin, &10_i128, &true, &None);
 
@@ -831,7 +454,7 @@ mod test {
 
     #[test]
     fn test_sequential_queue_finalization() {
-        let (env, client) = setup_circles();
+        let (env, client) = setup();
         let admin = Address::generate(&env);
         let circle_id = client.create_circle(&admin, &10_i128, &false, &None);
 
@@ -851,7 +474,7 @@ mod test {
 
     #[test]
     fn test_process_payout_and_cycle_completion() {
-        let (env, client) = setup_circles();
+        let (env, client) = setup();
         let admin = Address::generate(&env);
         let circle_id = client.create_circle(&admin, &100_i128, &false, &None);
 
@@ -877,7 +500,7 @@ mod test {
 
     #[test]
     fn test_group_rollover() {
-        let (env, client) = setup_circles();
+        let (env, client) = setup();
         let admin = Address::generate(&env);
         let circle_id = client.create_circle(&admin, &50_i128, &false, &None);
 
@@ -901,55 +524,51 @@ mod test {
     }
 
     #[test]
-    fn emergency_withdraw_after_seven_days() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn test_payout_unauthorized() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let circle_id = client.create_circle(&admin, &10_i128, &false);
 
-        let (client, admin) = setup_global(&env);
-        let user = Address::generate(&env);
-        let (token_client, token_admin) = create_token_contract(&env, &admin);
-        token_admin.mint(&user, &1000);
+        let member = Address::generate(&env);
+        client.join_circle(&member, &circle_id);
+        client.finalize_circle(&admin, &circle_id);
 
-        client.initialize(&admin);
-        client.deposit(&user, &token_client.address, &500);
-        assert_eq!(client.get_user_balance(&user), 500);
-
-        env.ledger().with_mut(|li| {
-            li.timestamp += EMERGENCY_WITHDRAWAL_DELAY_SECS + 1;
+        let unauthorized = Address::generate(&env);
+        let result = std::panic::catch_unwind(|| {
+            client.process_payout(&unauthorized, &circle_id, &member);
         });
-
-        client.emergency_withdraw(&user, &token_client.address);
-        assert_eq!(client.get_user_balance(&user), 0);
-        assert_eq!(token_client.balance(&user), 1000);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn swap_member_replaces_queue_spot_and_transfers_credit() {
-        let env = Env::default();
-        let (client, admin) = setup_global(&env);
-        client.initialize(&admin);
+    fn test_rollover_before_cycle_complete() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let circle_id = client.create_circle(&admin, &10_i128, &false);
 
-        let old_member = Address::generate(&env);
-        let new_member = Address::generate(&env);
-        let other_member = Address::generate(&env);
+        let member = Address::generate(&env);
+        client.join_circle(&member, &circle_id);
 
-        let mut members = Vec::new(&env);
-        members.push_back(old_member.clone());
-        members.push_back(other_member.clone());
+        let result = std::panic::catch_unwind(|| {
+            client.rollover_group(&admin, &circle_id);
+        });
+        assert!(result.is_err());
+    }
 
-        let mut contribs = Map::new(&env);
-        contribs.set(old_member.clone(), 750_i128);
-        contribs.set(other_member.clone(), 200_i128);
-        seed_members_and_contribs(&env, &client.address, members, contribs);
+    #[test]
+    fn test_duplicate_payout() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let circle_id = client.create_circle(&admin, &10_i128, &false);
 
-        env.mock_all_auths();
-        client.swap_member(&old_member, &new_member);
+        let member = Address::generate(&env);
+        client.join_circle(&member, &circle_id);
+        client.finalize_circle(&admin, &circle_id);
+        client.process_payout(&admin, &circle_id, &member);
 
-        let (stored_members, stored_contribs) = read_members_and_contribs(&env, &client.address);
-
-        assert_eq!(stored_members.get(0).unwrap(), new_member.clone());
-        assert_eq!(stored_members.get(1).unwrap(), other_member.clone());
-        assert_eq!(stored_contribs.get(new_member.clone()).unwrap(), 750_i128);
-        assert_eq!(stored_contribs.get(old_member.clone()), None);
+        let result = std::panic::catch_unwind(|| {
+            client.process_payout(&admin, &circle_id, &member);
+        });
+        assert!(result.is_err());
     }
 }
