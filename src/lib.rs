@@ -11,6 +11,8 @@ pub enum DataKey {
     Circle(u64),
     Member(Address),
     CircleCount,
+    // New: Tracks if a user has paid for a specific circle (CircleID, UserAddress)
+    Deposit(u64, Address),
     // New: Tracks pending exits (CircleID, MemberAddress)
     PendingExit(u64, Address),
     // New: Tracks Group Reserve balance for penalties
@@ -33,6 +35,7 @@ pub struct Member {
     pub contribution_count: u32,
     pub last_contribution_time: u64,
     pub status: MemberStatus,
+    pub total_contributed: u64,
 }
 
 #[contracttype]
@@ -59,6 +62,15 @@ pub struct CircleInfo {
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
     pub nft_contract: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupHealthUpdateEvent {
+    pub group_id: u64,
+    pub missed_payments: u32,
+    pub active_members: u32,
+    pub trust_score: u32,
 }
 
 // --- CONTRACT TRAIT ---
@@ -199,6 +211,7 @@ impl SoroSusuTrait for SoroSusu {
             contribution_count: 0,
             last_contribution_time: 0,
             status: MemberStatus::Active,
+            total_contributed: 0,
         };
         
         // 6. Store the member and update circle count
@@ -265,11 +278,34 @@ impl SoroSusuTrait for SoroSusu {
         // 7. Update member contribution info
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
+        member.total_contributed += circle.contribution_amount;
         
         // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
 
         // 9. Update circle deadline for next cycle
+        circle.deadline_timestamp = current_time + circle.cycle_duration;
+        circle.contribution_bitmap |= 1 << member.index;
+
+        // Emit a health snapshot for indexers/frontends.
+        let active_members = circle.member_count as u32;
+        let contributed_members = core::cmp::min(circle.contribution_bitmap.count_ones(), active_members);
+        let missed_payments = active_members.saturating_sub(contributed_members);
+        let trust_score = if active_members == 0 {
+            0
+        } else {
+            (contributed_members * 100) / active_members
+        };
+
+        let health_update = GroupHealthUpdateEvent {
+            group_id: circle_id,
+            missed_payments,
+            active_members,
+            trust_score,
+        };
+        env.events()
+            .publish((Symbol::new(&env, "GROUP_HEALTH"), circle_id), health_update);
+
         if circle.pending_cycle_duration > 0 && current_time >= circle.duration_change_effective_at {
             circle.cycle_duration = circle.pending_cycle_duration;
             circle.pending_cycle_duration = 0;
@@ -328,6 +364,8 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
 
+        if !member.is_active {
+            panic!("Member is ejected");
         if member.status != MemberStatus::Active {
             panic!("Member is not active");
         }
@@ -460,6 +498,7 @@ impl SoroSusuTrait for SoroSusu {
         new_member.require_auth();
 
         // Get the circle information
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
@@ -484,6 +523,8 @@ impl SoroSusuTrait for SoroSusu {
             panic!("New member is already part of a circle");
         }
 
+        // Calculate refund amount (pro-rata settlement: return only principal contributions)
+        let refund_amount = exiting_member.total_contributed;
         // Calculate refund amount on the fly (principal only).
         let refund_amount = exiting_member.contribution_count as u64 * circle.contribution_amount;
 
@@ -504,6 +545,7 @@ impl SoroSusuTrait for SoroSusu {
             contribution_count: 0,
             last_contribution_time: 0,
             status: MemberStatus::Active,
+            total_contributed: 0,
         };
 
         // Store the new member
@@ -1012,12 +1054,14 @@ mod fuzz_tests {
         // Verify member is active
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(member.is_active);
         assert_eq!(member.status, MemberStatus::Active);
 
         // Eject member should trigger burn (mocked) and set inactive
         SoroSusuTrait::eject_member(env.clone(), creator.clone(), circle_id, user.clone());
 
         let member_after: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(!member_after.is_active);
         assert_eq!(member_after.status, MemberStatus::Ejected);
 
         // Inactive member cannot deposit
