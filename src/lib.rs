@@ -12,10 +12,7 @@ pub enum DataKey {
     CircleCount,
     // New: Tracks if a user has paid for a specific circle (CircleID, UserAddress)
     Deposit(u64, Address),
-    // New: Tracks Group Reserve balance for penalties
-    GroupReserve,
-    // New: Tracks scheduled payout time for delayed release
-    ScheduledPayoutTime(u64),
+
 }
 
 #[contracttype]
@@ -25,8 +22,7 @@ pub struct Member {
     pub index: u32,
     pub contribution_count: u32,
     pub last_contribution_time: u64,
-    pub is_active: bool,
-}
+
 
 #[contracttype]
 #[derive(Clone)]
@@ -50,8 +46,7 @@ pub struct CircleInfo {
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
     pub nft_contract: Address,
-    pub is_round_finalized: bool, // New: Track if round is finalized
-    pub current_pot_recipient: Address, // New: Track who can claim the pot
+
 }
 
 // --- CONTRACT TRAIT ---
@@ -81,11 +76,6 @@ pub trait SoroSusuTrait {
     // Eject a member (burns NFT)
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
 
-    // Finalize a round (sets up delayed payout)
-    fn finalize_round(env: Env, caller: Address, circle_id: u64);
-
-    // Claim the pot after delay period
-    fn claim_pot(env: Env, caller: Address, circle_id: u64);
 }
 
 #[contractclient(name = "SusuNftClient")]
@@ -147,8 +137,7 @@ impl SoroSusuTrait for SoroSusu {
             proposed_late_fee_bps: 0,
             proposal_votes_bitmap: 0,
             nft_contract,
-            is_round_finalized: false,
-            current_pot_recipient: creator.clone(), // Initialize with creator
+
         };
 
         // 4. Save the Circle and the new Count
@@ -188,7 +177,7 @@ impl SoroSusuTrait for SoroSusu {
             index: circle.member_count as u32,
             contribution_count: 0,
             last_contribution_time: 0,
-            is_active: true,
+
         };
         
         // 6. Store the member and update circle count
@@ -217,8 +206,7 @@ impl SoroSusuTrait for SoroSusu {
         let mut member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
-        if !member.is_active {
-            panic!("Member is ejected");
+
         }
 
         // 4. Create the Token Client
@@ -255,6 +243,7 @@ impl SoroSusuTrait for SoroSusu {
         // 7. Update member contribution info
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
+
         
         // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
@@ -288,8 +277,7 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(member.clone());
         let member_info: Member = env.storage().instance().get(&member_key).unwrap();
 
-        if !member_info.is_active {
-            panic!("Member is ejected");
+
         }
 
         // Mark member as contributed in the bitmap
@@ -347,8 +335,7 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
 
-        if !member.is_active {
-            panic!("Member is ejected");
+
         }
 
         if circle.proposed_late_fee_bps == 0 {
@@ -379,12 +366,7 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(member.clone());
         let mut member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
 
-        if !member_info.is_active {
-            panic!("Member already ejected");
-        }
 
-        // Mark as inactive
-        member_info.is_active = false;
         env.storage().instance().set(&member_key, &member_info);
 
         // Burn NFT
@@ -393,97 +375,7 @@ impl SoroSusuTrait for SoroSusu {
         client.burn(&member, &token_id);
     }
 
-    fn finalize_round(env: Env, caller: Address, circle_id: u64) {
-        caller.require_auth();
-
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-
-        // Only creator can finalize round
-        if caller != circle.creator {
-            panic!("Unauthorized: Only creator can finalize round");
-        }
-
-        // Check if round is already finalized
-        if circle.is_round_finalized {
-            panic!("Round is already finalized");
-        }
-
-        // Check if all members have contributed (all bits set in contribution_bitmap)
-        let expected_bitmap = (1u64 << circle.member_count) - 1;
-        if circle.contribution_bitmap != expected_bitmap {
-            panic!("Not all members have contributed");
-        }
-
-        // Set scheduled payout time (24 hours from now)
-        let current_time = env.ledger().timestamp();
-        let scheduled_payout_time = current_time + 86400; // 24 hours in seconds
-
-        // Set the creator as the recipient for this round
-        circle.current_pot_recipient = circle.creator.clone();
-        
-        // Update circle state
-        circle.is_round_finalized = true;
-        
-        // Store scheduled payout time
-        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &scheduled_payout_time);
-        
-        // Save updated circle
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-
-        // Reset for next round
-        circle.contribution_bitmap = 0;
-        circle.payout_bitmap |= 1 << circle.current_recipient_index;
-        circle.current_recipient_index = (circle.current_recipient_index + 1) % circle.max_members;
-        circle.insurance_balance = 0;
-        circle.is_insurance_used = false;
-        
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-    }
-
-    fn claim_pot(env: Env, caller: Address, circle_id: u64) {
-        caller.require_auth();
-
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-
-        // Check if round is finalized
-        if !circle.is_round_finalized {
-            panic!("Round is not finalized");
-        }
-
-        // Check if caller is the designated recipient
-        if caller != circle.current_pot_recipient {
-            panic!("Caller is not the designated recipient");
-        }
-
-        // Check if the time buffer has passed
-        let scheduled_payout_time: u64 = env.storage().instance().get(&DataKey::ScheduledPayoutTime(circle_id))
-            .unwrap_or_else(|| panic!("No scheduled payout time found"));
-        
-        let current_time = env.ledger().timestamp();
-        if current_time < scheduled_payout_time {
-            panic!("Payout time has not arrived yet");
-        }
-
-        // Calculate pot amount
-        let pot_amount = (circle.contribution_amount * circle.member_count as u64);
-
-        // Transfer the pot to the recipient
-        let token_client = token::Client::new(&env, &circle.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &caller,
-            &pot_amount
-        );
-
-        // Reset round state for next cycle
-        circle.is_round_finalized = false;
-        circle.current_pot_recipient = circle.creator.clone(); // Reset to creator
-        
-        // Clear scheduled payout time
-        env.storage().instance().remove(&DataKey::ScheduledPayoutTime(circle_id));
-        
-        // Save updated circle
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+<
     }
 }
 
@@ -943,178 +835,7 @@ mod fuzz_tests {
     }
 
     #[test]
-    fn test_delayed_pot_release() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let user3 = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
 
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000,
-            3,
-            token.clone(),
-            604800,
-            0,
-            nft_contract.clone(),
-        );
-
-        // Add members
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
-
-        env.mock_all_auths();
-
-        // All members deposit
-        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
-        SoroSusuTrait::deposit(env.clone(), user3.clone(), circle_id);
-
-        // Finalize the round
-        SoroSusuTrait::finalize_round(env.clone(), creator.clone(), circle_id);
-
-        // Check that round is finalized and scheduled payout time is set
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        assert!(circle.is_round_finalized);
-        assert_eq!(circle.current_pot_recipient, creator);
-
-        let scheduled_time: u64 = env.storage().instance().get(&DataKey::ScheduledPayoutTime(circle_id)).unwrap();
-        let current_time = env.ledger().timestamp();
-        assert!(scheduled_time > current_time);
-        assert_eq!(scheduled_time - current_time, 86400); // 24 hours
-
-        // Try to claim before time buffer - should fail
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), creator.clone(), circle_id);
-        });
-        assert!(result.is_err());
-
-        // Advance time by 24 hours
-        env.ledger().set_timestamp(current_time + 86400);
-
-        // Now claim should succeed
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), creator.clone(), circle_id);
-        });
-        assert!(result.is_ok());
-
-        // Check that round is reset
-        let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        assert!(!circle_after.is_round_finalized);
-        assert!(!env.storage().instance().has(&DataKey::ScheduledPayoutTime(circle_id)));
-    }
-
-    #[test]
-    fn test_finalize_round_requirements() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
-
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000,
-            2,
-            token.clone(),
-            604800,
-            0,
-            nft_contract.clone(),
-        );
-
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
-
-        env.mock_all_auths();
-
-        // Try to finalize without all contributions - should fail
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::finalize_round(env.clone(), creator.clone(), circle_id);
-        });
-        assert!(result.is_err());
-
-        // Only one member deposits
-        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
-
-        // Still should fail
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::finalize_round(env.clone(), creator.clone(), circle_id);
-        });
-        assert!(result.is_err());
-
-        // Second member deposits
-        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
-
-        // Now should succeed
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::finalize_round(env.clone(), creator.clone(), circle_id);
-        });
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_claim_pot_authorization() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
-
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000,
-            2,
-            token.clone(),
-            604800,
-            0,
-            nft_contract.clone(),
-        );
-
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
-
-        env.mock_all_auths();
-
-        // All members deposit and finalize
-        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
-        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
-        SoroSusuTrait::finalize_round(env.clone(), creator.clone(), circle_id);
-
-        // Advance time
-        env.ledger().set_timestamp(env.ledger().timestamp() + 86400);
-
-        // Non-recipient trying to claim should fail
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), user1.clone(), circle_id);
-        });
-        assert!(result.is_err());
-
-        // Creator (recipient) should be able to claim
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::claim_pot(env.clone(), creator.clone(), circle_id);
-        });
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn test_nft_membership() {
         let env = Env::default();
         let admin = Address::generate(&env);
