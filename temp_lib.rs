@@ -14,6 +14,8 @@ pub enum DataKey {
     Deposit(u64, Address),
     // New: Tracks Group Reserve balance for penalties
     GroupReserve,
+    // Rate limiting: Tracks last circle creation timestamp per user
+    LastCreatedTimestamp(Address),
 }
 
 #[contracttype]
@@ -101,6 +103,22 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64 {
+        // Rate limiting: Check if creator has created a circle recently
+        let current_time = env.ledger().timestamp();
+        let rate_limit_key = DataKey::LastCreatedTimestamp(creator.clone());
+        
+        if let Some(last_created) = env.storage().instance().get::<DataKey, u64>(&rate_limit_key) {
+            let time_elapsed = current_time.saturating_sub(last_created);
+            const RATE_LIMIT_SECONDS: u64 = 300; // 5 minutes
+            
+            if time_elapsed < RATE_LIMIT_SECONDS {
+                panic!("Rate limit: Must wait 5 minutes between circle creations");
+            }
+        }
+        
+        // Update last created timestamp
+        env.storage().instance().set(&rate_limit_key, &current_time);
+        
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
         
@@ -116,7 +134,6 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         // 3. Create the Circle Data Struct
-        let current_time = env.ledger().timestamp();
         let new_circle = CircleInfo {
             id: circle_count,
             creator: creator.clone(),
