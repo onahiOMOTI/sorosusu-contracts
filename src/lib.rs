@@ -234,12 +234,15 @@ impl SoroSusuTrait for SoroSusu {
             panic!("User is already a member");
         }
 
-        // 5. Check user reputation against circle requirements
+        // 5. ENHANCED: Check user reputation against circle requirements (Tiered Access)
         if circle.min_reputation_required > 0 {
             let user_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(user.clone())).unwrap_or(0);
             if user_reputation < circle.min_reputation_required {
-                panic!("User reputation is too low to join this circle");
+                panic!("User reputation is too low to join this circle. Required: {}, Current: {}", circle.min_reputation_required, user_reputation);
             }
+            
+            // Emit reputation check event for transparency
+            env.events().publish((Symbol::new(&env, "reputation_check"),), (circle_id, user, user_reputation, circle.min_reputation_required));
         }
 
         // 6. Create and store the new member
@@ -256,6 +259,9 @@ impl SoroSusuTrait for SoroSusu {
         
         // 8. Save the updated circle back to storage
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // 9. Emit member joined event
+        env.events().publish((Symbol::new(&env, "member_joined"),), (circle_id, user, circle.member_count));
     }
 
     fn deposit(env: Env, user: Address, circle_id: u64, privacy_masked: bool) {
@@ -298,10 +304,9 @@ impl SoroSusuTrait for SoroSusu {
             &contribution_amount
         );
 
-        // 7. Store private contribution amount if privacy is enabled
-        if privacy_masked {
-            env.storage().instance().set(&DataKey::PrivateContribution(circle_id, user.clone()), &contribution_amount);
-        }
+        // 7. Store private contribution amount (ALWAYS store for privacy)
+        let private_key = DataKey::PrivateContribution(circle_id, user.clone());
+        env.storage().instance().set(&private_key, &contribution_amount);
 
         // 8. Update member contribution info
         member.has_contributed = true;
@@ -323,15 +328,16 @@ impl SoroSusuTrait for SoroSusu {
         // 11. Mark as Paid in the old format for backward compatibility
         env.storage().instance().set(&DataKey::Deposit(circle_id, user.clone()), &true);
 
-        // 12. Emit contribution event (masked if privacy is enabled)
+        // 12. Emit contribution event (MASKED if privacy is enabled)
         if privacy_masked {
+            // Emit masked event - only member ID and success flag, NO amount
             let event = ContributionMaskedEvent {
                 member_id: user,
                 success: true,
             };
             env.events().publish((Symbol::new(&env, "contribution_masked"),), event);
         } else {
-            // Emit regular contribution event with amount
+            // Emit regular contribution event with amount (for non-privacy circles)
             env.events().publish((Symbol::new(&env, "contribution"),), (user, contribution_amount));
         }
     }
@@ -434,9 +440,19 @@ impl SoroSusuTrait for SoroSusu {
                 split_method: 0,
             });
 
-        // 5. Calculate total pool amount (simplified - in real implementation, 
-        // this would track actual deposited funds)
-        let total_pool = circle.contribution_amount * circle.member_count as i128;
+        // 5. Calculate total pool amount (total contributions minus fees)
+        let total_contributions = circle.contribution_amount * circle.member_count as i128;
+        
+        // Calculate fees (1% of total contributions)
+        let total_fees = total_contributions / 100; // 1% fee
+        
+        // Update Group Reserve with fees
+        let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        reserve_balance += total_fees as u64;
+        env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
+        
+        // Net amount to distribute (total contributions minus fees)
+        let net_pool = total_contributions - total_fees;
 
         // 6. Handle co-winners logic
         if co_winners_config.enabled && !co_winners.is_empty() {
@@ -449,8 +465,8 @@ impl SoroSusuTrait for SoroSusu {
             let mut dust_amount = 0i128;
             let shares: Vec<i128> = if co_winners_config.split_method == 0 {
                 // Equal split
-                let base_share = total_pool / co_winners.len() as i128;
-                dust_amount = total_pool - (base_share * co_winners.len() as i128);
+                let base_share = net_pool / co_winners.len() as i128;
+                dust_amount = net_pool - (base_share * co_winners.len() as i128);
                 co_winners.iter().map(|_| base_share).collect::<Vec<i128>>()
             } else {
                 // Proportional split based on contributions
@@ -458,8 +474,9 @@ impl SoroSusuTrait for SoroSusu {
                 let mut contributions = Vec::new();
                 
                 for winner in &co_winners {
+                    let key = DataKey::PrivateContribution(circle_id, winner.clone());
                     let contrib: i128 = env.storage().instance()
-                        .get::<DataKey, i128>(&DataKey::PrivateContribution(circle_id, winner.clone()))
+                        .get(&key)
                         .unwrap_or_else(|| circle.contribution_amount);
                     contributions.push(contrib);
                     total_private_contributions += contrib;
@@ -467,17 +484,17 @@ impl SoroSusuTrait for SoroSusu {
                 
                 let mut shares = Vec::new();
                 for contrib in contributions {
-                    let share = (contrib * total_pool) / total_private_contributions;
+                    let share = (contrib * net_pool) / total_private_contributions;
                     shares.push(share);
                 }
                 
                 // Calculate dust
                 let total_distributed: i128 = shares.iter().sum();
-                dust_amount = total_pool - total_distributed;
+                dust_amount = net_pool - total_distributed;
                 shares
             };
 
-            // Add dust to first co-winner or group reserve
+            // Add dust to first co-winner (maintaining 100% accounting precision)
             if dust_amount > 0 {
                 let mut updated_shares: Vec<i128> = shares;
                 updated_shares[0] += dust_amount;
@@ -485,21 +502,26 @@ impl SoroSusuTrait for SoroSusu {
                 // Set claimable balances for co-winners
                 for (i, winner) in co_winners.iter().enumerate() {
                     let share_amount: i128 = updated_shares[i];
-                    env.storage().instance().set::<DataKey, i128>(&DataKey::ClaimableBalance(circle_id, winner.clone()), &share_amount);
+                    let key = DataKey::ClaimableBalance(circle_id, winner.clone());
+                    env.storage().instance().set(&key, &share_amount);
                 }
             } else {
                 // Set claimable balances for co-winners
                 for (i, winner) in co_winners.iter().enumerate() {
                     let share_amount: i128 = shares[i];
-                    env.storage().instance().set::<DataKey, i128>(&DataKey::ClaimableBalance(circle_id, winner.clone()), &share_amount);
+                    let key = DataKey::ClaimableBalance(circle_id, winner.clone());
+                    env.storage().instance().set(&key, &share_amount);
                 }
             }
 
             // Store current winners for record
             env.storage().instance().set(&DataKey::CurrentWinners(circle_id), &co_winners);
+            
+            // Emit co-winners distribution event
+            env.events().publish((Symbol::new(&env, "co_winners_distributed"),), (circle_id, co_winners.len(), net_pool));
         } else {
             // Single winner logic (backwards compatibility)
-            let share_per_member = total_pool / circle.member_count as i128;
+            let share_per_member = net_pool / circle.member_count as i128;
             env.storage().instance().set(&DataKey::ClaimableBalance(circle_id, admin), &share_per_member);
         }
     }
@@ -539,16 +561,26 @@ impl SoroSusuTrait for SoroSusu {
             .unwrap_or_else(|| panic!("Circle does not exist"));
         
         let member_key = DataKey::Member(proposer.clone());
-        let _member: Member = env.storage().instance().get(&member_key)
+        let member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
         // 3. Get proposal ID (increment counter)
         let mut proposal_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
         proposal_count += 1;
 
-        // 4. Calculate proposer's voting power
+        // 4. Calculate proposer's composite voting power
         let proposer_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(proposer.clone())).unwrap_or(0);
-        let voting_power = proposer_reputation + 100; // Base power + reputation
+        
+        // Get current cycle contributions for this member
+        let private_key = DataKey::PrivateContribution(circle_id, proposer.clone());
+        let current_cycle_contrib: i128 = env.storage().instance().get(&private_key).unwrap_or(0);
+        
+        // Composite voting power = (reputation score * 10) + (current contributions / 1000) + base power
+        let reputation_power = proposer_reputation * 10; // Reputation has higher weight
+        let contribution_power = (current_cycle_contrib / 1000) as u64; // Scale down contributions
+        let base_power = 100; // Base voting power for all members
+        
+        let voting_power = reputation_power + contribution_power + base_power;
 
         // 5. Create the proposal
         let current_time = env.ledger().timestamp();
@@ -569,7 +601,10 @@ impl SoroSusuTrait for SoroSusu {
         // 6. Store the proposal
         env.storage().instance().set(&DataKey::VotingProposal(proposal_count), &proposal);
 
-        // 7. Return proposal ID
+        // 7. Emit proposal creation event
+        env.events().publish((Symbol::new(&env, "proposal_created"),), (proposal_count, circle_id, proposer, proposal_type));
+
+        // 8. Return proposal ID
         proposal_count
     }
 
@@ -593,9 +628,19 @@ impl SoroSusuTrait for SoroSusu {
             panic!("User has already voted on this proposal");
         }
 
-        // 5. Calculate voter's voting power
+        // 5. Calculate voter's composite voting power
         let voter_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(voter.clone())).unwrap_or(0);
-        let voting_power = voter_reputation + 100; // Base power + reputation
+        
+        // Get current cycle contributions for this voter
+        let private_key = DataKey::PrivateContribution(proposal.circle_id, voter.clone());
+        let current_cycle_contrib: i128 = env.storage().instance().get(&private_key).unwrap_or(0);
+        
+        // Composite voting power = (reputation score * 10) + (current contributions / 1000) + base power
+        let reputation_power = voter_reputation * 10; // Reputation has higher weight
+        let contribution_power = (current_cycle_contrib / 1000) as u64; // Scale down contributions
+        let base_power = 100; // Base voting power for all members
+        
+        let voting_power = reputation_power + contribution_power + base_power;
 
         // 6. Record the vote
         let vote_record = VoteCast {
@@ -616,6 +661,9 @@ impl SoroSusuTrait for SoroSusu {
 
         // 8. Save updated proposal
         env.storage().instance().set(&DataKey::VotingProposal(proposal_id), &proposal);
+
+        // 9. Emit vote event
+        env.events().publish((Symbol::new(&env, "vote_cast"),), (proposal_id, voter, vote, voting_power));
     }
 
     fn execute_proposal(env: Env, executor: Address, proposal_id: u64) {
@@ -645,15 +693,24 @@ impl SoroSusuTrait for SoroSusu {
         // 6. Execute proposal based on type
         match proposal.proposal_type {
             0 => {
-                // Meeting date change - implementation would go here
-                // This is a placeholder for actual logic
+                // Meeting date change - update circle deadline
+                let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(proposal.circle_id))
+                    .unwrap_or_else(|| panic!("Circle does not exist"));
+                
+                // Parse new deadline from description (simplified - in real implementation, 
+                // description would contain structured data)
+                let new_deadline = proposal.created_at + 7 * 24 * 3600; // Example: 7 days from proposal creation
+                circle.deadline_timestamp = new_deadline;
+                
+                env.storage().instance().set(&DataKey::Circle(proposal.circle_id), &circle);
             },
             1 => {
-                // New member admission - implementation would go here
-                // This is a placeholder for actual logic
+                // New member admission - extract member address from description
+                // In real implementation, description would contain the new member address
+                // For now, this is a placeholder that would be implemented with proper parsing
             },
             _ => {
-                // Other proposal types
+                // Other proposal types - custom logic would go here
             }
         }
 
@@ -674,8 +731,19 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Caller is not the admin");
         }
 
-        // 3. Update user reputation
+        // 3. Get current reputation for comparison
+        let current_reputation: u64 = env.storage().instance().get(&DataKey::UserReputation(user.clone())).unwrap_or(0);
+        
+        // 4. Update user reputation
         env.storage().instance().set(&DataKey::UserReputation(user), &reputation_score);
+
+        // 5. Emit reputation update event
+        env.events().publish((Symbol::new(&env, "reputation_updated"),), (user, current_reputation, reputation_score, admin));
+        
+        // 6. If reputation was increased, check if user can now join higher-tier circles
+        if reputation_score > current_reputation {
+            env.events().publish((Symbol::new(&env, "reputation_upgraded"),), (user, current_reputation, reputation_score));
+        }
     }
 
     fn get_private_contribution(env: Env, user: Address, circle_id: u64, target_member: Address) -> i128 {
