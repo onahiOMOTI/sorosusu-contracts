@@ -37,6 +37,14 @@ pub enum Error {
     LeniencyNotRequested = 25,
     CannotVoteForOwnRequest = 26,
     InvalidVote = 27,
+    ProposalNotFound = 28,
+    ProposalAlreadyExecuted = 29,
+    VotingNotActive = 30,
+    InsufficientVotingPower = 31,
+    QuadraticVoteExceeded = 32,
+    InvalidProposalType = 33,
+    QuorumNotMet = 34,
+    ProposalExpired = 35,
 }
 
 // --- CONSTANTS ---
@@ -46,6 +54,11 @@ const LENIENCY_GRACE_PERIOD: u64 = 172800; // 48 hours in seconds
 const VOTING_PERIOD: u64 = 86400; // 24 hours voting period
 const MINIMUM_VOTING_PARTICIPATION: u32 = 50; // 50% minimum participation
 const SIMPLE_MAJORITY_THRESHOLD: u32 = 51; // 51% simple majority
+const QUADRATIC_VOTING_PERIOD: u64 = 604800; // 7 days for rule changes
+const QUADRATIC_QUORUM: u32 = 40; // 40% quorum for quadratic voting
+const QUADRATIC_MAJORITY: u32 = 60; // 60% supermajority for rule changes
+const MAX_VOTE_WEIGHT: u32 = 100; // Maximum quadratic vote weight
+const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for groups >= 10 members
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
 const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
 
@@ -71,6 +84,10 @@ pub enum DataKey {
     LeniencyVotes(u64, Address, Address),
     SocialCapital(Address, u64),
     LeniencyStats(u64),
+    Proposal(u64),
+    QuadraticVote(u64, Address),
+    VotingPower(Address, u64),
+    ProposalStats(u64),
 }
 
 #[contracttype]
@@ -84,6 +101,126 @@ pub enum MemberStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+pub enum LeniencyVote {
+    Approve,
+    Reject,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeniencyRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalType {
+    ChangeLateFee,
+    ChangeInsuranceFee,
+    ChangeCycleDuration,
+    AddMember,
+    RemoveMember,
+    ChangeQuorum,
+    EmergencyAction,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Draft,
+    Active,
+    Approved,
+    Rejected,
+    Executed,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuadraticVoteChoice {
+    For,
+    Against,
+    Abstain,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LeniencyRequest {
+    pub requester: Address,
+    pub circle_id: u64,
+    pub request_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: LeniencyRequestStatus,
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+    pub total_votes_cast: u32,
+    pub extension_hours: u64,
+    pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Proposal {
+    pub id: u64,
+    pub circle_id: u64,
+    pub proposer: Address,
+    pub proposal_type: ProposalType,
+    pub title: String,
+    pub description: String,
+    pub created_timestamp: u64,
+    pub voting_start_timestamp: u64,
+    pub voting_end_timestamp: u64,
+    pub status: ProposalStatus,
+    pub for_votes: u64,
+    pub against_votes: u64,
+    pub total_voting_power: u64,
+    pub quorum_met: bool,
+    pub execution_data: String, // JSON or structured data for execution
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QuadraticVote {
+    pub voter: Address,
+    pub proposal_id: u64,
+    pub vote_weight: u32,
+    pub vote_choice: QuadraticVoteChoice,
+    pub voting_power_used: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VotingPower {
+    pub member: Address,
+    pub circle_id: u64,
+    pub token_balance: i128,
+    pub quadratic_power: u64,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ProposalStats {
+    pub total_proposals: u32,
+    pub approved_proposals: u32,
+    pub rejected_proposals: u32,
+    pub executed_proposals: u32,
+    pub average_participation: u32,
+    pub average_voting_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LeniencyStats {
+    pub total_requests: u32,
+    pub approved_requests: u32,
+    pub rejected_requests: u32,
+    pub expired_requests: u32,
+    pub average_participation: u32,
 pub enum CollateralStatus {
     NotStaked,
     Staked,
@@ -93,6 +230,13 @@ pub enum CollateralStatus {
 
 #[contracttype]
 #[derive(Clone)]
+pub struct SocialCapital {
+    pub member: Address,
+    pub circle_id: u64,
+    pub leniency_given: u32,
+    pub leniency_received: u32,
+    pub voting_participation: u32,
+    pub trust_score: u32,
 pub struct CollateralInfo {
     pub member: Address,
     pub circle_id: u64,
@@ -136,6 +280,10 @@ pub struct CircleInfo {
     pub nft_contract: Address,
     pub is_round_finalized: bool,
     pub current_pot_recipient: Option<Address>,
+    pub leniency_enabled: bool,
+    pub grace_period_end: Option<u64>,
+    pub quadratic_voting_enabled: bool,
+    pub proposal_count: u64,
     pub requires_collateral: bool,
     pub collateral_bps: u32,
     pub total_cycle_value: i128,
@@ -191,6 +339,24 @@ pub trait SoroSusuTrait {
     fn get_leniency_request(env: Env, circle_id: u64, requester: Address) -> LeniencyRequest;
     fn get_social_capital(env: Env, member: Address, circle_id: u64) -> SocialCapital;
     fn get_leniency_stats(env: Env, circle_id: u64) -> LeniencyStats;
+    
+    // Quadratic voting functions
+    fn create_proposal(
+        env: Env,
+        proposer: Address,
+        circle_id: u64,
+        proposal_type: ProposalType,
+        title: String,
+        description: String,
+        execution_data: String,
+    ) -> u64;
+    
+    fn quadratic_vote(env: Env, voter: Address, proposal_id: u64, vote_weight: u32, vote_choice: QuadraticVoteChoice);
+    fn execute_proposal(env: Env, caller: Address, proposal_id: u64);
+    fn get_proposal(env: Env, proposal_id: u64) -> Proposal;
+    fn get_voting_power(env: Env, member: Address, circle_id: u64) -> VotingPower;
+    fn get_proposal_stats(env: Env, circle_id: u64) -> ProposalStats;
+    fn update_voting_power(env: Env, member: Address, circle_id: u64, token_balance: i128);
     // Collateral functions
     fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128);
     fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
@@ -272,6 +438,8 @@ impl SoroSusuTrait for SoroSusu {
             current_pot_recipient: None,
             leniency_enabled: true,
             grace_period_end: None,
+            quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
+            proposal_count: 0,
             requires_collateral,
             collateral_bps,
             total_cycle_value,
@@ -807,6 +975,281 @@ impl SoroSusuTrait for SoroSusu {
             expired_requests: 0,
             average_participation: 0,
         })
+    }
+
+    // --- QUADRATIC VOTING IMPLEMENTATION ---
+
+    fn create_proposal(
+        env: Env,
+        proposer: Address,
+        circle_id: u64,
+        proposal_type: ProposalType,
+        title: String,
+        description: String,
+        execution_data: String,
+    ) -> u64 {
+        proposer.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        if !circle.quadratic_voting_enabled {
+            panic!("Quadratic voting not enabled for this circle");
+        }
+
+        let member_key = DataKey::Member(proposer.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member_info.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut proposal_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        proposal_count += 1;
+
+        let new_proposal = Proposal {
+            id: proposal_count,
+            circle_id,
+            proposer: proposer.clone(),
+            proposal_type,
+            title,
+            description,
+            created_timestamp: current_time,
+            voting_start_timestamp: current_time,
+            voting_end_timestamp: current_time + QUADRATIC_VOTING_PERIOD,
+            status: ProposalStatus::Active,
+            for_votes: 0,
+            against_votes: 0,
+            total_voting_power: 0,
+            quorum_met: false,
+            execution_data,
+        };
+
+        env.storage().instance().set(&DataKey::Proposal(proposal_count), &new_proposal);
+
+        // Update circle proposal count
+        let mut circle_info = circle;
+        circle_info.proposal_count += 1;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle_info);
+
+        // Update proposal stats
+        let stats_key = DataKey::ProposalStats(circle_id);
+        let mut stats: ProposalStats = env.storage().instance().get(&stats_key).unwrap_or(ProposalStats {
+            total_proposals: 0,
+            approved_proposals: 0,
+            rejected_proposals: 0,
+            executed_proposals: 0,
+            average_participation: 0,
+            average_voting_time: 0,
+        });
+        stats.total_proposals += 1;
+        env.storage().instance().set(&stats_key, &stats);
+
+        proposal_count
+    }
+
+    fn quadratic_vote(env: Env, voter: Address, proposal_id: u64, vote_weight: u32, vote_choice: QuadraticVoteChoice) {
+        voter.require_auth();
+
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = env.storage().instance().get(&proposal_key)
+            .expect("Proposal not found");
+
+        if proposal.status != ProposalStatus::Active {
+            panic!("Voting not active for this proposal");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time > proposal.voting_end_timestamp {
+            proposal.status = ProposalStatus::Expired;
+            env.storage().instance().set(&proposal_key, &proposal);
+            panic!("Voting period expired");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::QuadraticVote(proposal_id, voter.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted on this proposal");
+        }
+
+        // Get voting power
+        let voting_power_key = DataKey::VotingPower(voter.clone(), proposal.circle_id);
+        let voting_power: VotingPower = env.storage().instance().get(&voting_power_key)
+            .expect("Voting power not calculated");
+
+        if vote_weight > MAX_VOTE_WEIGHT {
+            panic!("Vote weight exceeds maximum");
+        }
+
+        // Calculate quadratic voting cost: weight^2
+        let voting_cost = (vote_weight as u64) * (vote_weight as u64);
+        
+        if voting_cost > voting_power.quadratic_power {
+            panic!("Insufficient voting power");
+        }
+
+        // Record the vote
+        let quadratic_vote = QuadraticVote {
+            voter: voter.clone(),
+            proposal_id,
+            vote_weight,
+            vote_choice,
+            voting_power_used: voting_cost,
+            timestamp: current_time,
+        };
+
+        env.storage().instance().set(&vote_key, &quadratic_vote);
+
+        // Update proposal tallies
+        match vote_choice {
+            QuadraticVoteChoice::For => {
+                proposal.for_votes += voting_cost;
+            }
+            QuadraticVoteChoice::Against => {
+                proposal.against_votes += voting_cost;
+            }
+            QuadraticVoteChoice::Abstain => {
+                // Abstain votes don't affect the outcome
+            }
+        }
+
+        proposal.total_voting_power += voting_cost;
+
+        // Check quorum
+        let circle_key = DataKey::Circle(proposal.circle_id);
+        let circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+        let required_quorum = (circle.member_count * QUADRATIC_QUORUM) / 100;
+        proposal.quorum_met = proposal.total_voting_power >= required_quorum as u64;
+
+        env.storage().instance().set(&proposal_key, &proposal);
+    }
+
+    fn execute_proposal(env: Env, caller: Address, proposal_id: u64) {
+        caller.require_auth();
+
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = env.storage().instance().get(&proposal_key)
+            .expect("Proposal not found");
+
+        if proposal.status != ProposalStatus::Active {
+            panic!("Proposal not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time <= proposal.voting_end_timestamp {
+            panic!("Voting period not yet ended");
+        }
+
+        if !proposal.quorum_met {
+            proposal.status = ProposalStatus::Rejected;
+            env.storage().instance().set(&proposal_key, &proposal);
+            panic!("Quorum not met");
+        }
+
+        // Calculate result
+        let total_votes = proposal.for_votes + proposal.against_votes;
+        if total_votes == 0 {
+            proposal.status = ProposalStatus::Rejected;
+        } else {
+            let approval_percentage = (proposal.for_votes * 100) / total_votes;
+            if approval_percentage >= QUADRATIC_MAJORITY as u64 {
+                proposal.status = ProposalStatus::Approved;
+                
+                // Execute the proposal based on type
+                self.execute_proposal_logic(&env, &proposal);
+            } else {
+                proposal.status = ProposalStatus::Rejected;
+            }
+        }
+
+        env.storage().instance().set(&proposal_key, &proposal);
+
+        // Update stats
+        let stats_key = DataKey::ProposalStats(proposal.circle_id);
+        let mut stats: ProposalStats = env.storage().instance().get(&stats_key).unwrap_or(ProposalStats {
+            total_proposals: 0,
+            approved_proposals: 0,
+            rejected_proposals: 0,
+            executed_proposals: 0,
+            average_participation: 0,
+            average_voting_time: 0,
+        });
+
+        match proposal.status {
+            ProposalStatus::Approved => stats.approved_proposals += 1,
+            ProposalStatus::Rejected => stats.rejected_proposals += 1,
+            ProposalStatus::Executed => stats.executed_proposals += 1,
+            _ => {}
+        }
+
+        env.storage().instance().set(&stats_key, &stats);
+    }
+
+    fn execute_proposal_logic(env: &Env, proposal: &Proposal) {
+        // This would contain the logic to execute different proposal types
+        // For now, we'll just mark as executed
+        let proposal_key = DataKey::Proposal(proposal.id);
+        let mut updated_proposal = proposal.clone();
+        updated_proposal.status = ProposalStatus::Executed;
+        env.storage().instance().set(&proposal_key, &updated_proposal);
+
+        // In a full implementation, this would:
+        // - Parse execution_data
+        // - Execute the appropriate actions based on proposal_type
+        // - Handle errors and rollbacks if needed
+    }
+
+    fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        let proposal_key = DataKey::Proposal(proposal_id);
+        env.storage().instance().get(&proposal_key).expect("Proposal not found")
+    }
+
+    fn get_voting_power(env: Env, member: Address, circle_id: u64) -> VotingPower {
+        let voting_power_key = DataKey::VotingPower(member, circle_id);
+        env.storage().instance().get(&voting_power_key).unwrap_or(VotingPower {
+            member,
+            circle_id,
+            token_balance: 0,
+            quadratic_power: 0,
+            last_updated: 0,
+        })
+    }
+
+    fn get_proposal_stats(env: Env, circle_id: u64) -> ProposalStats {
+        let stats_key = DataKey::ProposalStats(circle_id);
+        env.storage().instance().get(&stats_key).unwrap_or(ProposalStats {
+            total_proposals: 0,
+            approved_proposals: 0,
+            rejected_proposals: 0,
+            executed_proposals: 0,
+            average_participation: 0,
+            average_voting_time: 0,
+        })
+    }
+
+    fn update_voting_power(env: Env, member: Address, circle_id: u64, token_balance: i128) {
+        // Calculate quadratic voting power as sqrt(token_balance)
+        // We use integer approximation: sqrt(x) ≈ x / (sqrt(x) + 1) for simplicity
+        // In production, you'd use a proper sqrt implementation
+        
+        let quadratic_power = if token_balance > 0 {
+            // Simple approximation of square root for demonstration
+            // In practice, you'd use a more accurate method
+            let balance_u64 = token_balance as u64;
+            (balance_u64 / 1000).max(1) // Simplified calculation
+        } else {
+            0
+        };
+
+        let voting_power = VotingPower {
+            member: member.clone(),
+            circle_id,
+            token_balance,
+            quadratic_power,
+            last_updated: env.ledger().timestamp(),
+        };
+
+        env.storage().instance().set(&DataKey::VotingPower(member, circle_id), &voting_power);
     fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128) {
         user.require_auth();
         
