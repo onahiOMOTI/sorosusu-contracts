@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token,
     Address, Env, Symbol, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
     Address, Env, String, Symbol, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env,
@@ -645,6 +646,8 @@ fn next_active_member_index(env: &Env, circle: &CircleInfo, start_index: u32) ->
     fn release_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address);
 
+    // Privacy functions
+    fn get_reputation_hash(env: Env, user: Address) -> BytesN<32>;
     // Oracle & Blacklist
     fn get_reliability_score(env: Env, user: Address) -> u32;
     fn is_blacklisted(env: Env, user: Address) -> bool;
@@ -1858,6 +1861,25 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
+    fn get_reputation_hash(env: Env, user: Address) -> BytesN<32> {
+        let member_key = DataKey::Member(user.clone());
+        let member_info_opt: Option<Member> = env.storage().instance().get(&member_key);
+        
+        let has_good_reputation = match member_info_opt {
+            Some(member_info) => {
+                member_info.contribution_count > 3 && member_info.status == MemberStatus::Active
+            },
+            None => false,
+        };
+        
+        let mut payload = Bytes::new(&env);
+        if has_good_reputation {
+            payload.push_back(1u32);
+        } else {
+            payload.push_back(0u32);
+        }
+        
+        env.crypto().sha256(&payload)
     fn get_reliability_score(env: Env, user: Address) -> u32 {
         let rep_key = DataKey::Reputation(user.clone());
         let rep: Reputation = env.storage().instance().get(&rep_key).unwrap_or(Reputation {
