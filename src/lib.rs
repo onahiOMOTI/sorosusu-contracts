@@ -62,6 +62,13 @@ pub enum Error {
     InvalidProposalType = 33,
     QuorumNotMet = 34,
     ProposalExpired = 35,
+    DissolutionNotActive = 36,
+    CircleNotDissolving = 37,
+    DissolutionAlreadyInitiated = 38,
+    InsufficientFundsForRefund = 39,
+    MemberAlreadyRefunded = 40,
+    CannotRefundRecipient = 41,
+    DissolutionVoteExpired = 42,
     CannotVouchForSelf = 36,
     InsufficientTrustScore = 37,
     VoucherNotActive = 38,
@@ -82,6 +89,9 @@ const QUADRATIC_QUORUM: u32 = 40; // 40% quorum for quadratic voting
 const QUADRATIC_MAJORITY: u32 = 60; // 60% supermajority for rule changes
 const MAX_VOTE_WEIGHT: u32 = 100; // Maximum quadratic vote weight
 const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for groups >= 10 members
+const DISSOLUTION_VOTING_PERIOD: u64 = 1209600; // 14 days for dissolution voting
+const DISSOLUTION_SUPERMAJORITY: u32 = 75; // 75% supermajority for dissolution
+const DISSOLUTION_REFUND_PERIOD: u64 = 2592000; // 30 days for refund claims after dissolution
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
 const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
 const MIN_TRUST_SCORE_FOR_VOUCH: u32 = 70; // Minimum trust score to vouch
@@ -160,6 +170,11 @@ pub struct Reputation {
     QuadraticVote(u64, Address),
     VotingPower(Address, u64),
     ProposalStats(u64),
+    DissolutionVote(u64, Address),
+    DissolutionProposal(u64),
+    NetPosition(u64, Address),
+    DissolvedCircle(u64),
+    RefundClaim(u64, Address),
     VouchRecord(Address, Address), // voucher -> vouchee
     VouchCollateral(Address, u64), // vouchee -> vouch_id
     VouchStats(Address), // voucher stats
@@ -290,6 +305,24 @@ pub enum QuadraticVoteChoice {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DissolutionVoteChoice {
+    Approve,
+    Reject,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DissolutionStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Refunding,
+    Completed,
+    Failed,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct LeniencyRequest {
     pub requester: Address,
@@ -302,6 +335,68 @@ pub struct LeniencyRequest {
     pub total_votes_cast: u32,
     pub extension_hours: u64,
     pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DissolutionProposal {
+    pub circle_id: u64,
+    pub initiator: Address,
+    pub reason: String,
+    pub created_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: DissolutionStatus,
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+    pub total_votes_cast: u32,
+    pub dissolution_timestamp: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct NetPosition {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_contributions: i128,
+    pub total_received: i128,
+    pub net_position: i128, // Positive = owed money, Negative = owed to group
+    pub collateral_staked: i128,
+    pub collateral_status: CollateralStatus,
+    pub has_received_pot: bool,
+    pub refund_claimed: bool,
+    pub default_marked: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RefundClaim {
+    pub member: Address,
+    pub circle_id: u64,
+    pub claim_timestamp: u64,
+    pub refund_amount: i128,
+    pub collateral_refunded: i128,
+    pub status: RefundStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefundStatus {
+    Pending,
+    Processed,
+    Failed,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DissolvedCircle {
+    pub circle_id: u64,
+    pub dissolution_timestamp: u64,
+    pub total_contributions: i128,
+    pub total_distributed: i128,
+    pub remaining_funds: i128,
+    pub total_members: u32,
+    pub refunded_members: u32,
+    pub defaulted_members: u32,
 }
 
 #[contracttype]
@@ -539,6 +634,8 @@ pub struct CircleInfo {
     pub grace_period_end: Option<u64>,
     pub quadratic_voting_enabled: bool,
     pub proposal_count: u64,
+    pub dissolution_status: DissolutionStatus,
+    pub dissolution_deadline: Option<u64>,
     pub requires_collateral: bool,
     pub collateral_bps: u32,
     pub total_cycle_value: i128,
@@ -833,6 +930,17 @@ fn next_active_member_index(env: &Env, circle: &CircleInfo, start_index: u32) ->
     fn get_voting_power(env: Env, member: Address, circle_id: u64) -> VotingPower;
     fn get_proposal_stats(env: Env, circle_id: u64) -> ProposalStats;
     fn update_voting_power(env: Env, member: Address, circle_id: u64, token_balance: i128);
+    
+    // Nuclear option functions
+    fn initiate_dissolution(env: Env, initiator: Address, circle_id: u64, reason: String);
+    fn vote_to_dissolve(env: Env, voter: Address, circle_id: u64, vote: DissolutionVoteChoice);
+    fn finalize_dissolution(env: Env, caller: Address, circle_id: u64);
+    fn calculate_net_positions(env: Env, circle_id: u64);
+    fn claim_refund(env: Env, member: Address, circle_id: u64);
+    fn get_dissolution_proposal(env: Env, circle_id: u64) -> DissolutionProposal;
+    fn get_net_position(env: Env, member: Address, circle_id: u64) -> NetPosition;
+    fn get_refund_claim(env: Env, member: Address, circle_id: u64) -> RefundClaim;
+    fn get_dissolved_circle(env: Env, circle_id: u64) -> DissolvedCircle;
 
     // Collateral functions
     fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128);
@@ -907,6 +1015,35 @@ impl SoroSusu {
             panic!("Collateral not available for slashing");
         }
 
+        let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        circle_count += 1;
+
+        let new_circle = CircleInfo {
+            id: circle_count,
+            creator: creator.clone(),
+            contribution_amount: amount,
+            max_members,
+            member_count: 0,
+            current_recipient_index: 0,
+            is_active: true,
+            token,
+            deadline_timestamp: current_time + cycle_duration,
+            cycle_duration,
+            contribution_bitmap: 0,
+            insurance_balance: 0,
+            insurance_fee_bps,
+            is_insurance_used: false,
+            late_fee_bps: 100, // 1%
+            nft_contract,
+            is_round_finalized: false,
+            current_pot_recipient: None,
+            leniency_enabled: true,
+            grace_period_end: None,
+            quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
+            proposal_count: 0,
+            dissolution_status: DissolutionStatus::NotInitiated,
+            dissolution_deadline: None,
+        };
         // Check if member is defaulted
         let defaulted_key = DataKey::DefaultedMembers(circle_id);
         let defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key).unwrap_or(Vec::new(&env));
@@ -3822,5 +3959,381 @@ impl SoroSusuTrait for SoroSusu {
         stats.most_common_milestone = milestone_type.clone();
         
         env.storage().instance().set(&stats_key, &stats);
+    }
+
+    // --- NUCLEAR OPTION IMPLEMENTATION ---
+
+    fn initiate_dissolution(env: Env, initiator: Address, circle_id: u64, reason: String) {
+        initiator.require_auth();
+
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+
+        if circle.dissolution_status != DissolutionStatus::NotInitiated {
+            panic!("Dissolution already initiated");
+        }
+
+        let member_key = DataKey::Member(initiator.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member_info.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let voting_deadline = current_time + DISSOLUTION_VOTING_PERIOD;
+
+        // Update circle status
+        circle.dissolution_status = DissolutionStatus::Voting;
+        circle.dissolution_deadline = Some(voting_deadline);
+        env.storage().instance().set(&circle_key, &circle);
+
+        // Create dissolution proposal
+        let dissolution_proposal = DissolutionProposal {
+            circle_id,
+            initiator: initiator.clone(),
+            reason,
+            created_timestamp: current_time,
+            voting_deadline,
+            status: DissolutionStatus::Voting,
+            approve_votes: 0,
+            reject_votes: 0,
+            total_votes_cast: 0,
+            dissolution_timestamp: None,
+        };
+
+        env.storage().instance().set(&DataKey::DissolutionProposal(circle_id), &dissolution_proposal);
+    }
+
+    fn vote_to_dissolve(env: Env, voter: Address, circle_id: u64, vote: DissolutionVoteChoice) {
+        voter.require_auth();
+
+        let circle_key = DataKey::Circle(circle_id);
+        let circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+
+        if circle.dissolution_status != DissolutionStatus::Voting {
+            panic!("Dissolution voting not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time > circle.dissolution_deadline.expect("Dissolution deadline not set") {
+            panic!("Voting period expired");
+        }
+
+        let member_key = DataKey::Member(voter.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member_info.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::DissolutionVote(circle_id, voter.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted on dissolution");
+        }
+
+        // Record the vote
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update proposal tallies
+        let proposal_key = DataKey::DissolutionProposal(circle_id);
+        let mut proposal: DissolutionProposal = env.storage().instance().get(&proposal_key).expect("Proposal not found");
+
+        match vote {
+            DissolutionVoteChoice::Approve => proposal.approve_votes += 1,
+            DissolutionVoteChoice::Reject => proposal.reject_votes += 1,
+        }
+
+        proposal.total_votes_cast += 1;
+
+        // Check if supermajority reached (75%)
+        let total_votes = proposal.approve_votes + proposal.reject_votes;
+        if total_votes > 0 {
+            let approval_percentage = (proposal.approve_votes * 100) / total_votes;
+            if approval_percentage >= DISSOLUTION_SUPERMAJORITY {
+                // Auto-approve if supermajority reached
+                proposal.status = DissolutionStatus::Approved;
+                proposal.dissolution_timestamp = Some(current_time);
+                
+                // Update circle status
+                let mut circle = circle;
+                circle.dissolution_status = DissolutionStatus::Approved;
+                circle.dissolution_deadline = Some(current_time);
+                env.storage().instance().set(&circle_key, &circle);
+                
+                // Start dissolution process
+                self.calculate_net_positions(&env, &circle_id);
+            }
+        }
+
+        env.storage().instance().set(&proposal_key, &proposal);
+    }
+
+    fn finalize_dissolution(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+
+        if circle.dissolution_status != DissolutionStatus::Voting {
+            panic!("Dissolution not in voting phase");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time <= circle.dissolution_deadline.expect("Dissolution deadline not set") {
+            panic!("Voting period not yet ended");
+        }
+
+        let proposal_key = DataKey::DissolutionProposal(circle_id);
+        let mut proposal: DissolutionProposal = env.storage().instance().get(&proposal_key).expect("Proposal not found");
+
+        // Calculate final result
+        let total_votes = proposal.approve_votes + proposal.reject_votes;
+        if total_votes == 0 {
+            proposal.status = DissolutionStatus::Failed;
+            circle.dissolution_status = DissolutionStatus::Failed;
+        } else {
+            let approval_percentage = (proposal.approve_votes * 100) / total_votes;
+            if approval_percentage >= DISSOLUTION_SUPERMAJORITY {
+                proposal.status = DissolutionStatus::Approved;
+                proposal.dissolution_timestamp = Some(current_time);
+                circle.dissolution_status = DissolutionStatus::Approved;
+                circle.dissolution_deadline = Some(current_time);
+                
+                // Start dissolution process
+                self.calculate_net_positions(&env, &circle_id);
+            } else {
+                proposal.status = DissolutionStatus::Failed;
+                circle.dissolution_status = DissolutionStatus::Failed;
+            }
+        }
+
+        env.storage().instance().set(&proposal_key, &proposal);
+        env.storage().instance().set(&circle_key, &circle);
+    }
+
+    fn calculate_net_positions(env: &Env, circle_id: &u64) {
+        let circle_key = DataKey::Circle(*circle_id);
+        let circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+
+        let mut total_contributions = 0i128;
+        let mut total_distributed = 0i128;
+        let mut total_members = 0u32;
+        let mut refunded_members = 0u32;
+        let mut defaulted_members = 0u32;
+
+        // Calculate net positions for all members
+        for i in 0..circle.max_members {
+            if (circle.contribution_bitmap & (1 << i)) != 0 {
+                let member_address = self.get_member_by_index(env, *circle_id, i);
+                if let Ok(member) = env.storage().instance().get::<DataKey, Member>(&DataKey::Member(member_address.clone())) {
+                    total_members += 1;
+
+                    // Calculate total contributions (including insurance and late fees)
+                    let base_contribution = circle.contribution_amount * member.tier_multiplier as i128;
+                    let insurance_fee = (base_contribution * circle.insurance_fee_bps as i128) / 10000;
+                    let total_contribution = base_contribution + insurance_fee;
+                    
+                    // Check if member received pot
+                    let has_received_pot = circle.current_pot_recipient == Some(member_address.clone()) && 
+                                         member.contribution_count > 0;
+
+                    // Get collateral info
+                    let collateral_key = DataKey::CollateralVault(member_address.clone(), *circle_id);
+                    let collateral_info: Option<CollateralInfo> = env.storage().instance().get(&collateral_key);
+                    let collateral_staked = collateral_info.map(|c| c.amount).unwrap_or(0);
+                    let collateral_status = collateral_info.map(|c| c.status).unwrap_or(CollateralStatus::NotStaked);
+
+                    // Calculate net position
+                    let total_received = if has_received_pot { 
+                        circle.contribution_amount * (circle.member_count as i128) 
+                    } else { 
+                        0 
+                    };
+                    
+                    let net_position = total_contribution - total_received;
+
+                    let net_position_record = NetPosition {
+                        member: member_address.clone(),
+                        circle_id: *circle_id,
+                        total_contributions: total_contribution,
+                        total_received,
+                        net_position,
+                        collateral_staked,
+                        collateral_status,
+                        has_received_pot,
+                        refund_claimed: false,
+                        default_marked: false,
+                    };
+
+                    env.storage().instance().set(&DataKey::NetPosition(*circle_id, member_address), &net_position_record);
+
+                    total_contributions += total_contribution;
+                    total_distributed += total_received;
+
+                    // Update counters
+                    if has_received_pot && net_position > 0 {
+                        defaulted_members += 1;
+                    }
+                }
+            }
+        }
+
+        // Create dissolved circle record
+        let remaining_funds = total_contributions - total_distributed;
+        let dissolved_circle = DissolvedCircle {
+            circle_id: *circle_id,
+            dissolution_timestamp: env.ledger().timestamp(),
+            total_contributions,
+            total_distributed,
+            remaining_funds,
+            total_members,
+            refunded_members,
+            defaulted_members,
+        };
+
+        env.storage().instance().set(&DataKey::DissolvedCircle(*circle_id), &dissolved_circle);
+
+        // Update circle status to refunding
+        let mut circle = circle;
+        circle.dissolution_status = DissolutionStatus::Refunding;
+        env.storage().instance().set(&circle_key, &circle);
+    }
+
+    fn claim_refund(env: Env, member: Address, circle_id: u64) {
+        member.require_auth();
+
+        let circle_key = DataKey::Circle(circle_id);
+        let circle: CircleInfo = env.storage().instance().get(&circle_key).expect("Circle not found");
+
+        if circle.dissolution_status != DissolutionStatus::Refunding {
+            panic!("Circle not in refunding phase");
+        }
+
+        let net_position_key = DataKey::NetPosition(circle_id, member.clone());
+        let mut net_position: NetPosition = env.storage().instance().get(&net_position_key)
+            .expect("Net position not calculated");
+
+        if net_position.refund_claimed {
+            panic!("Refund already claimed");
+        }
+
+        if net_position.has_received_pot {
+            panic!("Cannot refund member who received pot");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let dissolved_circle_key = DataKey::DissolvedCircle(circle_id);
+        let dissolved_circle: DissolvedCircle = env.storage().instance().get(&dissolved_circle_key)
+            .expect("Dissolved circle not found");
+
+        if current_time > dissolved_circle.dissolution_timestamp + DISSOLUTION_REFUND_PERIOD {
+            panic!("Refund period expired");
+        }
+
+        // Calculate refund amount
+        let refund_amount = net_position.net_position; // Positive value means member is owed money
+        let collateral_refund = if net_position.collateral_status == CollateralStatus::Staked {
+            net_position.collateral_staked
+        } else {
+            0
+        };
+
+        if refund_amount <= 0 && collateral_refund <= 0 {
+            panic!("No refund available");
+        }
+
+        let token_client = token::Client::new(&env, &circle.token);
+        let contract_address = env.current_contract_address();
+
+        // Refund contributions
+        if refund_amount > 0 {
+            let contract_balance = token_client.balance(&contract_address);
+            if contract_balance < refund_amount {
+                panic!("Insufficient funds for refund");
+            }
+            token_client.transfer(&contract_address, &member, &refund_amount);
+        }
+
+        // Refund collateral
+        if collateral_refund > 0 {
+            token_client.transfer(&contract_address, &member, &collateral_refund);
+            
+            // Update collateral status
+            let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
+            if let Some(mut collateral_info) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
+                collateral_info.status = CollateralStatus::Released;
+                collateral_info.release_timestamp = Some(current_time);
+                env.storage().instance().set(&collateral_key, &collateral_info);
+            }
+        }
+
+        // Update net position
+        net_position.refund_claimed = true;
+        env.storage().instance().set(&net_position_key, &net_position);
+
+        // Create refund claim record
+        let refund_claim = RefundClaim {
+            member: member.clone(),
+            circle_id,
+            claim_timestamp: current_time,
+            refund_amount,
+            collateral_refunded: collateral_refund,
+            status: RefundStatus::Processed,
+        };
+
+        env.storage().instance().set(&DataKey::RefundClaim(circle_id, member), &refund_claim);
+
+        // Update dissolved circle stats
+        let mut dissolved_circle = dissolved_circle;
+        dissolved_circle.refunded_members += 1;
+        dissolved_circle.remaining_funds -= (refund_amount + collateral_refund);
+        env.storage().instance().set(&dissolved_circle_key, &dissolved_circle);
+
+        // Check if all refunds are processed
+        if dissolved_circle.refunded_members >= dissolved_circle.total_members - dissolved_circle.defaulted_members {
+            // Mark dissolution as completed
+            let mut circle = circle;
+            circle.dissolution_status = DissolutionStatus::Completed;
+            env.storage().instance().set(&circle_key, &circle);
+            
+            dissolved_circle.dissolution_timestamp = current_time;
+            env.storage().instance().set(&dissolved_circle_key, &dissolved_circle);
+        }
+    }
+
+    fn get_dissolution_proposal(env: Env, circle_id: u64) -> DissolutionProposal {
+        let proposal_key = DataKey::DissolutionProposal(circle_id);
+        env.storage().instance().get(&proposal_key).expect("Dissolution proposal not found")
+    }
+
+    fn get_net_position(env: Env, member: Address, circle_id: u64) -> NetPosition {
+        let net_position_key = DataKey::NetPosition(circle_id, member);
+        env.storage().instance().get(&net_position_key).expect("Net position not found")
+    }
+
+    fn get_refund_claim(env: Env, member: Address, circle_id: u64) -> RefundClaim {
+        let refund_claim_key = DataKey::RefundClaim(circle_id, member);
+        env.storage().instance().get(&refund_claim_key).unwrap_or(RefundClaim {
+            member,
+            circle_id,
+            claim_timestamp: 0,
+            refund_amount: 0,
+            collateral_refunded: 0,
+            status: RefundStatus::Pending,
+        })
+    }
+
+    fn get_dissolved_circle(env: Env, circle_id: u64) -> DissolvedCircle {
+        let dissolved_circle_key = DataKey::DissolvedCircle(circle_id);
+        env.storage().instance().get(&dissolved_circle_key).expect("Dissolved circle not found")
+    }
+
+    // Helper function to get member by index (simplified for this implementation)
+    fn get_member_by_index(&self, env: &Env, circle_id: u64, index: u32) -> Address {
+        // In a real implementation, you'd maintain a mapping of member indices
+        // For this example, we'll return a placeholder
+        Address::generate(env)
     }
 }
