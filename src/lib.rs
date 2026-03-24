@@ -76,6 +76,18 @@ const INACTIVITY_THRESHOLD_MONTHS: u64 = 18; // 18 months inactivity threshold
 const DECAY_PERCENTAGE_PER_MONTH: u32 = 50; // 5% decay per month (50 basis points)
 const SECONDS_PER_MONTH: u64 = 2592000; // 30 days in seconds
 
+// --- MILESTONE CONSTANTS ---
+const CONSECUTIVE_ON_TIME_BONUS_5: u32 = 10; // 10 points for 5 consecutive on-time payments
+const CONSECUTIVE_ON_TIME_BONUS_10: u32 = 25; // 25 points for 10 consecutive on-time payments
+const CONSECUTIVE_ON_TIME_BONUS_12: u32 = 40; // 40 points for 12 consecutive on-time payments (full cycle)
+const FIRST_GROUP_ORGANIZED_BONUS: u32 = 15; // 15 points for organizing first group
+const PERFECT_ATTENDANCE_BONUS: u32 = 20; // 20 points for perfect attendance in a cycle
+const EARLY_BIRD_STREAK_BONUS: u32 = 5; // 5 points for 3 consecutive early payments
+const REFERRAL_MASTER_BONUS: u32 = 8; // 8 points for 3 successful referrals
+const VOUCHING_CHAMPION_BONUS: u32 = 12; // 12 points for 5 successful vouches
+const COMMUNITY_LEADER_BONUS: u32 = 18; // 18 points for high participation in voting
+const RELIABILITY_STAR_BONUS: u32 = 30; // 30 points for 100% reliability over 6 months
+
 // --- DATA STRUCTURES ---
 
 #[contracttype]
@@ -108,6 +120,64 @@ pub enum DataKey {
     VouchReverseMapping(Address, u64), // vouchee -> voucher (for efficient lookup)
     LastActivityTimestamp(Address), // Track user's last activity for reputation decay
     DecayHistory(Address, u64), // Track decay applications per user per circle
+    MilestoneProgress(Address, u64), // Track milestone progress per user per circle
+    MilestoneBonuses(Address, u64), // Track earned milestone bonuses per user per circle
+    MilestoneStats(u64), // Global milestone statistics per circle
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MilestoneType {
+    ConsecutiveOnTimePayments,
+    FirstGroupOrganized,
+    PerfectAttendance,
+    EarlyBirdStreak,
+    ReferralMaster,
+    VouchingChampion,
+    CommunityLeader,
+    ReliabilityStar,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MilestoneStatus {
+    InProgress,
+    Completed,
+    Claimed,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneProgress {
+    pub member: Address,
+    pub circle_id: u64,
+    pub milestone_type: MilestoneType,
+    pub current_progress: u32,
+    pub target_progress: u32,
+    pub status: MilestoneStatus,
+    pub start_timestamp: u64,
+    pub completion_timestamp: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneBonus {
+    pub member: Address,
+    pub circle_id: u64,
+    pub milestone_type: MilestoneType,
+    pub bonus_points: u32,
+    pub earned_timestamp: u64,
+    pub is_applied: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneStats {
+    pub circle_id: u64,
+    pub total_milestones_completed: u32,
+    pub total_bonus_points_distributed: u32,
+    pub members_with_milestones: u32,
+    pub most_common_milestone: MilestoneType,
 }
 
 #[contracttype]
@@ -434,6 +504,15 @@ pub trait SoroSusuTrait {
     fn apply_reputation_decay(env: Env, member: Address, circle_id: u64);
     fn update_activity_timestamp(env: Env, member: Address, circle_id: u64);
     fn get_reputation_with_decay(env: Env, member: Address, circle_id: u64) -> SocialCapital;
+    
+    // Milestone-based reputation boost functions
+    fn update_milestone_progress(env: Env, member: Address, circle_id: u64, milestone_type: MilestoneType, progress_increment: u32);
+    fn check_and_award_milestones(env: Env, member: Address, circle_id: u64);
+    fn apply_milestone_bonus(env: Env, member: Address, circle_id: u64);
+    fn get_milestone_progress(env: Env, member: Address, circle_id: u64, milestone_type: MilestoneType) -> MilestoneProgress;
+    fn get_milestone_bonuses(env: Env, member: Address, circle_id: u64) -> Vec<MilestoneBonus>;
+    fn get_milestone_stats(env: Env, circle_id: u64) -> MilestoneStats;
+    fn calculate_total_reputation_boost(env: Env, member: Address, circle_id: u64) -> u32;
 }
 
 // --- IMPLEMENTATION ---
@@ -660,6 +739,12 @@ impl SoroSusuTrait for SoroSusu {
         
         // Update activity timestamp for reputation decay
         Self::update_activity_timestamp(&env, user, circle_id);
+        
+        // Check and award milestones based on this contribution
+        Self::check_and_award_milestones(env, user.clone(), circle_id);
+        
+        // Apply any pending milestone bonuses
+        Self::apply_milestone_bonus(env, user.clone(), circle_id);
     }
 
     fn finalize_round(env: Env, caller: Address, circle_id: u64) {
@@ -938,6 +1023,12 @@ impl SoroSusuTrait for SoroSusu {
         
         // Update activity timestamp for reputation decay
         Self::update_activity_timestamp(&env, voter, circle_id);
+        
+        // Check and award milestones based on voting participation
+        Self::check_and_award_milestones(env, voter.clone(), circle_id);
+        
+        // Apply any pending milestone bonuses
+        Self::apply_milestone_bonus(env, voter.clone(), circle_id);
 
         // Check if voting should be finalized early (if majority reached)
         let total_possible_votes = (circle.member_count - 1) as u32; // Exclude requester
@@ -1007,7 +1098,7 @@ impl SoroSusuTrait for SoroSusu {
                     leniency_received: 0,
                     voting_participation: 0,
                     trust_score: 50,
-                    last_activity_timestamp: current_time,
+                    last_activity_timestamp: env.ledger().timestamp(),
                     decay_count: 0,
                 });
                 social_capital.leniency_received += 1;
@@ -1546,7 +1637,7 @@ impl SoroSusuTrait for SoroSusu {
             leniency_received: 0,
             voting_participation: 0,
             trust_score: 50,
-            last_activity_timestamp: current_time,
+            last_activity_timestamp: env.ledger().timestamp(),
             decay_count: 0,
         });
         
@@ -1625,6 +1716,12 @@ impl SoroSusuTrait for SoroSusu {
         
         // Update activity timestamp for reputation decay
         Self::update_activity_timestamp(&env, voucher, circle_id);
+        
+        // Check and award milestones based on vouching activity
+        Self::check_and_award_milestones(env, voucher.clone(), circle_id);
+        
+        // Apply any pending milestone bonuses
+        Self::apply_milestone_bonus(env, voucher.clone(), circle_id);
     }
     
     fn slash_vouch_collateral(env: Env, caller: Address, circle_id: u64, vouchee: Address) {
@@ -1683,7 +1780,6 @@ impl SoroSusuTrait for SoroSusu {
         
         // Decrease voucher's trust score due to slash
         let social_capital_key = DataKey::SocialCapital(voucher.clone(), circle_id);
-        let current_time = env.ledger().timestamp();
         let mut social_capital: SocialCapital = env.storage().instance().get(&social_capital_key).unwrap_or(SocialCapital {
             member: voucher.clone(),
             circle_id,
@@ -1691,7 +1787,7 @@ impl SoroSusuTrait for SoroSusu {
             leniency_received: 0,
             voting_participation: 0,
             trust_score: 50,
-            last_activity_timestamp: current_time,
+            last_activity_timestamp: env.ledger().timestamp(),
             decay_count: 0,
         });
         social_capital.trust_score = (social_capital.trust_score - 10).max(0); // Significant penalty for slash
@@ -1750,7 +1846,6 @@ impl SoroSusuTrait for SoroSusu {
         
         // Increase voucher's trust score due to successful vouch
         let social_capital_key = DataKey::SocialCapital(voucher.clone(), circle_id);
-        let current_time = env.ledger().timestamp();
         let mut social_capital: SocialCapital = env.storage().instance().get(&social_capital_key).unwrap_or(SocialCapital {
             member: voucher.clone(),
             circle_id,
@@ -1758,7 +1853,7 @@ impl SoroSusuTrait for SoroSusu {
             leniency_received: 0,
             voting_participation: 0,
             trust_score: 50,
-            last_activity_timestamp: current_time,
+            last_activity_timestamp: env.ledger().timestamp(),
             decay_count: 0,
         });
         social_capital.trust_score = (social_capital.trust_score + 5).min(100); // Bonus for successful vouch
@@ -1871,5 +1966,254 @@ impl SoroSusuTrait for SoroSusu {
             last_activity_timestamp: env.ledger().timestamp(),
             decay_count: 0,
         })
+    }
+    
+    // --- MILESTONE-BASED REPUTATION BOOST IMPLEMENTATION ---
+    
+    fn update_milestone_progress(env: Env, member: Address, circle_id: u64, milestone_type: MilestoneType, progress_increment: u32) {
+        let current_time = env.ledger().timestamp();
+        let progress_key = DataKey::MilestoneProgress(member.clone(), circle_id);
+        
+        // Get existing progress or create new
+        let mut milestone_progress: MilestoneProgress = env.storage().instance().get(&progress_key).unwrap_or(MilestoneProgress {
+            member: member.clone(),
+            circle_id,
+            milestone_type: milestone_type.clone(),
+            current_progress: 0,
+            target_progress: Self::get_milestone_target(&milestone_type),
+            status: MilestoneStatus::InProgress,
+            start_timestamp: current_time,
+            completion_timestamp: None,
+        });
+        
+        // Only update if milestone is still in progress
+        if milestone_progress.status == MilestoneStatus::InProgress {
+            milestone_progress.current_progress += progress_increment;
+            
+            // Check if milestone is completed
+            if milestone_progress.current_progress >= milestone_progress.target_progress {
+                milestone_progress.status = MilestoneStatus::Completed;
+                milestone_progress.completion_timestamp = Some(current_time);
+                
+                // Award the milestone bonus
+                Self::award_milestone_bonus(&env, &member, circle_id, &milestone_type);
+                
+                // Update milestone stats
+                Self::update_milestone_stats(&env, circle_id, &milestone_type);
+            }
+            
+            env.storage().instance().set(&progress_key, &milestone_progress);
+        }
+    }
+    
+    fn check_and_award_milestones(env: Env, member: Address, circle_id: u64) {
+        // This function checks various conditions and awards milestones automatically
+        // It's called after significant actions like deposits, voting, etc.
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let member_key = DataKey::Member(member.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+        
+        // Check consecutive on-time payments milestone
+        if member_info.contribution_count >= 5 {
+            Self::update_milestone_progress(env, member.clone(), circle_id, MilestoneType::ConsecutiveOnTimePayments, 1);
+        }
+        
+        // Check perfect attendance (completed all contributions)
+        if member_info.contribution_count >= circle.max_members {
+            Self::update_milestone_progress(env, member.clone(), circle_id, MilestoneType::PerfectAttendance, 1);
+        }
+        
+        // Check first group organized (for circle creators)
+        if member_info.address == circle.creator {
+            Self::update_milestone_progress(env, member.clone(), circle_id, MilestoneType::FirstGroupOrganized, 1);
+        }
+        
+        // Check referral master milestone
+        if let Some(referrer) = &member_info.referrer {
+            Self::update_milestone_progress(env, referrer.clone(), circle_id, MilestoneType::ReferralMaster, 1);
+        }
+        
+        // Check vouching champion milestone
+        let vouch_stats_key = DataKey::VouchStats(member.clone());
+        if let Some(vouch_stats) = env.storage().instance().get::<DataKey, VouchStats>(&vouch_stats_key) {
+            if vouch_stats.successful_vouches >= 5 {
+                Self::update_milestone_progress(env, member.clone(), circle_id, MilestoneType::VouchingChampion, 1);
+            }
+        }
+        
+        // Check community leader milestone (high voting participation)
+        let social_capital_key = DataKey::SocialCapital(member.clone(), circle_id);
+        if let Some(social_capital) = env.storage().instance().get::<DataKey, SocialCapital>(&social_capital_key) {
+            if social_capital.voting_participation >= 10 {
+                Self::update_milestone_progress(env, member.clone(), circle_id, MilestoneType::CommunityLeader, 1);
+            }
+        }
+        
+        // Check reliability star milestone (long-term consistency)
+        if social_capital.trust_score >= 95 && social_capital.decay_count == 0 {
+            Self::update_milestone_progress(env, member.clone(), circle_id, MilestoneType::ReliabilityStar, 1);
+        }
+    }
+    
+    fn apply_milestone_bonus(env: Env, member: Address, circle_id: u64) {
+        let bonuses_key = DataKey::MilestoneBonuses(member.clone(), circle_id);
+        let bonuses: Vec<MilestoneBonus> = env.storage().instance().get(&bonuses_key).unwrap_or(Vec::new(&env));
+        
+        let mut total_bonus = 0u32;
+        let current_time = env.ledger().timestamp();
+        
+        // Calculate total unapplied bonus points
+        for bonus in &bonuses {
+            if !bonus.is_applied {
+                total_bonus += bonus.bonus_points;
+            }
+        }
+        
+        if total_bonus > 0 {
+            // Apply bonus to social capital
+            let social_capital_key = DataKey::SocialCapital(member.clone(), circle_id);
+            let mut social_capital: SocialCapital = env.storage().instance().get(&social_capital_key).unwrap_or(SocialCapital {
+                member: member.clone(),
+                circle_id,
+                leniency_given: 0,
+                leniency_received: 0,
+                voting_participation: 0,
+                trust_score: 50,
+                last_activity_timestamp: current_time,
+                decay_count: 0,
+            });
+            
+            // Add bonus points to trust score (capped at 100)
+            social_capital.trust_score = (social_capital.trust_score + total_bonus).min(100);
+            env.storage().instance().set(&social_capital_key, &social_capital);
+            
+            // Mark bonuses as applied
+            let mut updated_bonuses = bonuses;
+            for bonus in &mut updated_bonuses {
+                if !bonus.is_applied {
+                    bonus.is_applied = true;
+                }
+            }
+            env.storage().instance().set(&bonuses_key, &updated_bonuses);
+        }
+    }
+    
+    fn get_milestone_progress(env: Env, member: Address, circle_id: u64, milestone_type: MilestoneType) -> MilestoneProgress {
+        let progress_key = DataKey::MilestoneProgress(member, circle_id);
+        env.storage().instance().get(&progress_key).unwrap_or(MilestoneProgress {
+            member,
+            circle_id,
+            milestone_type,
+            current_progress: 0,
+            target_progress: Self::get_milestone_target(&milestone_type),
+            status: MilestoneStatus::InProgress,
+            start_timestamp: env.ledger().timestamp(),
+            completion_timestamp: None,
+        })
+    }
+    
+    fn get_milestone_bonuses(env: Env, member: Address, circle_id: u64) -> Vec<MilestoneBonus> {
+        let bonuses_key = DataKey::MilestoneBonuses(member, circle_id);
+        env.storage().instance().get(&bonuses_key).unwrap_or(Vec::new(&env))
+    }
+    
+    fn get_milestone_stats(env: Env, circle_id: u64) -> MilestoneStats {
+        let stats_key = DataKey::MilestoneStats(circle_id);
+        env.storage().instance().get(&stats_key).unwrap_or(MilestoneStats {
+            circle_id,
+            total_milestones_completed: 0,
+            total_bonus_points_distributed: 0,
+            members_with_milestones: 0,
+            most_common_milestone: MilestoneType::ConsecutiveOnTimePayments,
+        })
+    }
+    
+    fn calculate_total_reputation_boost(env: Env, member: Address, circle_id: u64) -> u32 {
+        let bonuses_key = DataKey::MilestoneBonuses(member, circle_id);
+        let bonuses: Vec<MilestoneBonus> = env.storage().instance().get(&bonuses_key).unwrap_or(Vec::new(&env));
+        
+        let mut total_boost = 0u32;
+        for bonus in &bonuses {
+            if bonus.is_applied {
+                total_boost += bonus.bonus_points;
+            }
+        }
+        
+        total_boost
+    }
+    
+    // --- HELPER FUNCTIONS FOR MILESTONE SYSTEM ---
+    
+    fn get_milestone_target(milestone_type: &MilestoneType) -> u32 {
+        match milestone_type {
+            MilestoneType::ConsecutiveOnTimePayments => 5, // Base target, increases with tiers
+            MilestoneType::FirstGroupOrganized => 1,
+            MilestoneType::PerfectAttendance => 1,
+            MilestoneType::EarlyBirdStreak => 3,
+            MilestoneType::ReferralMaster => 3,
+            MilestoneType::VouchingChampion => 5,
+            MilestoneType::CommunityLeader => 10,
+            MilestoneType::ReliabilityStar => 1,
+        }
+    }
+    
+    fn get_milestone_bonus_points(milestone_type: &MilestoneType, progress: u32) -> u32 {
+        match milestone_type {
+            MilestoneType::ConsecutiveOnTimePayments => {
+                match progress {
+                    5 => CONSECUTIVE_ON_TIME_BONUS_5,
+                    10 => CONSECUTIVE_ON_TIME_BONUS_10,
+                    12 => CONSECUTIVE_ON_TIME_BONUS_12,
+                    _ => 0,
+                }
+            }
+            MilestoneType::FirstGroupOrganized => FIRST_GROUP_ORGANIZED_BONUS,
+            MilestoneType::PerfectAttendance => PERFECT_ATTENDANCE_BONUS,
+            MilestoneType::EarlyBirdStreak => EARLY_BIRD_STREAK_BONUS,
+            MilestoneType::ReferralMaster => REFERRAL_MASTER_BONUS,
+            MilestoneType::VouchingChampion => VOUCHING_CHAMPION_BONUS,
+            MilestoneType::CommunityLeader => COMMUNITY_LEADER_BONUS,
+            MilestoneType::ReliabilityStar => RELIABILITY_STAR_BONUS,
+        }
+    }
+    
+    fn award_milestone_bonus(env: &Env, member: &Address, circle_id: u64, milestone_type: &MilestoneType) {
+        let current_time = env.ledger().timestamp();
+        let bonus_points = Self::get_milestone_bonus_points(milestone_type, 1); // Base completion
+        
+        if bonus_points > 0 {
+            let bonuses_key = DataKey::MilestoneBonuses(member.clone(), circle_id);
+            let mut bonuses: Vec<MilestoneBonus> = env.storage().instance().get(&bonuses_key).unwrap_or(Vec::new(env));
+            
+            let new_bonus = MilestoneBonus {
+                member: member.clone(),
+                circle_id,
+                milestone_type: milestone_type.clone(),
+                bonus_points,
+                earned_timestamp: current_time,
+                is_applied: false,
+            };
+            
+            bonuses.push_back(new_bonus);
+            env.storage().instance().set(&bonuses_key, &bonuses);
+        }
+    }
+    
+    fn update_milestone_stats(env: &Env, circle_id: u64, milestone_type: &MilestoneType) {
+        let stats_key = DataKey::MilestoneStats(circle_id);
+        let mut stats: MilestoneStats = env.storage().instance().get(&stats_key).unwrap_or(MilestoneStats {
+            circle_id,
+            total_milestones_completed: 0,
+            total_bonus_points_distributed: 0,
+            members_with_milestones: 0,
+            most_common_milestone: milestone_type.clone(),
+        });
+        
+        stats.total_milestones_completed += 1;
+        stats.total_bonus_points_distributed += Self::get_milestone_bonus_points(milestone_type, 1);
+        stats.most_common_milestone = milestone_type.clone();
+        
+        env.storage().instance().set(&stats_key, &stats);
     }
 }
