@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Env, String, Symbol, Vec,
 };
 
 // --- ERROR CODES ---
@@ -60,11 +61,9 @@ pub enum DataKey {
     SafetyDeposit(Address, u64),
     GroupReserve,
     LendingPool,
-
-
-#[contracttype]
-#[derive(Clone)]
-
+    UserStats(Address),
+    ReputationData(Address),
+    SocialCapital(Address, u64),
 }
 
 #[contracttype]
@@ -73,6 +72,20 @@ pub struct UserStats {
     pub total_volume_saved: i128,
     pub on_time_contributions: u32,
     pub late_contributions: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReputationData {
+    pub user_address: Address,
+    pub susu_score: u32,        // 0-10000 bps (0-100%)
+    pub reliability_score: u32,  // 0-10000 bps (0-100%)
+    pub total_contributions: u32,
+    pub on_time_rate: u32,      // 0-10000 bps (0-100%)
+    pub volume_saved: i128,
+    pub social_capital: u32,    // 0-10000 bps (0-100%)
+    pub last_updated: u64,
+    pub is_active: bool,
 }
 
 #[contracttype]
@@ -444,6 +457,8 @@ pub trait SoroSusuTrait {
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
 
+    // Inter-contract reputation query interface
+    fn get_reputation(env: Env, user: Address) -> ReputationData;
 }
 
 // --- IMPLEMENTATION ---
@@ -1341,7 +1356,145 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&safety_key, &balance);
     }
 
+    fn get_reputation(env: Env, user: Address) -> ReputationData {
+        let current_time = env.ledger().timestamp();
+        
+        // Get user statistics
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
 
+        // Get member information to check if user is active
+        let member_key = DataKey::Member(user.clone());
+        let is_active = if let Some(member) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            member.status == MemberStatus::Active
+        } else {
+            false
+        };
+
+        // Calculate total contributions
+        let total_contributions = user_stats.on_time_contributions + user_stats.late_contributions;
+        
+        // Calculate on-time rate (in basis points)
+        let on_time_rate = if total_contributions > 0 {
+            (user_stats.on_time_contributions * 10000) / total_contributions
+        } else {
+            0
+        };
+
+        // Calculate reliability score based on on-time rate and volume
+        let mut reliability_score = on_time_rate;
+        
+        // Boost reliability based on volume saved (higher volume = higher reliability)
+        if user_stats.total_volume_saved > 0 {
+            let volume_bonus = ((user_stats.total_volume_saved / 1_000_000_0) * 100).min(2000); // Max 20% bonus
+            reliability_score = (reliability_score + volume_bonus).min(10000);
+        }
+
+        // Calculate social capital (sum of trust scores across all circles)
+        let mut social_capital = 0u32;
+        let mut circle_count = 0u32;
+        
+        // Get all circles the user is part of by checking member data
+        // For now, we'll use a simplified approach - in a full implementation,
+        // you might want to maintain an index of user's circles
+        for circle_id in 1..=1000 { // Reasonable limit for iteration
+            let circle_key = DataKey::Circle(circle_id);
+            if let Some(_circle) = env.storage().instance().get::<DataKey, CircleInfo>(&circle_key) {
+                let social_capital_key = DataKey::SocialCapital(user.clone(), circle_id);
+                if let Some(soc_cap) = env.storage().instance().get::<DataKey, SocialCapital>(&social_capital_key) {
+                    social_capital += soc_cap.trust_score;
+                    circle_count += 1;
+                }
+            }
+        }
+
+        // Average social capital across circles
+        let avg_social_capital = if circle_count > 0 {
+            (social_capital / circle_count) * 100 // Convert to basis points
+        } else {
+            0
+        };
+
+        // Calculate final Susu Score (weighted combination)
+        // Weight: 50% reliability, 30% social capital, 20% activity
+        let activity_score = if total_contributions > 0 {
+            ((total_contributions as u32).min(50) * 200) // Max 10% from activity
+        } else {
+            0
+        };
+
+        let susu_score = (
+            (reliability_score * 50) / 100 +  // 50% weight
+            (avg_social_capital * 30) / 100 +  // 30% weight  
+            (activity_score * 20) / 100         // 20% weight
+        ).min(10000);
+
+        ReputationData {
+            user_address: user.clone(),
+            susu_score,
+            reliability_score,
+            total_contributions,
+            on_time_rate,
+            volume_saved: user_stats.total_volume_saved,
+            social_capital: avg_social_capital,
+            last_updated: current_time,
+            is_active,
+        }
+    }
+
+    #[test]
+    fn test_get_reputation() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Test reputation for new user (should be zero/low)
+        let reputation = client.get_reputation(&user);
+        assert_eq!(reputation.susu_score, 0);
+        assert_eq!(reputation.reliability_score, 0);
+        assert_eq!(reputation.total_contributions, 0);
+        assert_eq!(reputation.on_time_rate, 0);
+        assert_eq!(reputation.volume_saved, 0);
+        assert_eq!(reputation.is_active, false);
+        
+        // Create circle and add user
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&user, &circle_id, &1, &None);
+        client.deposit(&user, &circle_id);
+        
+        // Test reputation after contribution
+        let reputation = client.get_reputation(&user);
+        assert!(reputation.susu_score > 0);
+        assert!(reputation.reliability_score > 0);
+        assert_eq!(reputation.total_contributions, 1);
+        assert_eq!(reputation.on_time_rate, 10000); // 100% on-time rate
+        assert_eq!(reputation.volume_saved, 1_000_000_000_000);
+        assert_eq!(reputation.is_active, true);
     }
 
     #[test]
