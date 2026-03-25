@@ -45,6 +45,10 @@ const DISSOLUTION_REFUND_PERIOD: u64 = 2592000; // 30 days for refund claims aft
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
 const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
 const MAX_QUERY_LIMIT: u32 = 100;
+const ROLLOVER_VOTING_PERIOD: u64 = 172800; // 48 hours for rollover voting
+const ROLLOVER_QUORUM: u32 = 60; // 60% quorum for rollover voting
+const ROLLOVER_MAJORITY: u32 = 66; // 66% supermajority for rollover approval
+const DEFAULT_ROLLOVER_BONUS_BPS: u32 = 5000; // 50% of platform fee refunded as bonus
 
 // --- DATA STRUCTURES ---
 
@@ -64,6 +68,23 @@ pub enum DataKey {
     UserStats(Address),
     ReputationData(Address),
     SocialCapital(Address, u64),
+    ProtocolFeeBps,
+    ProtocolTreasury,
+    AuditCount,
+    AuditEntry(u64),
+    AuditAll,
+    AuditByActor(Address),
+    AuditByResource(u64),
+    RolloverBonus(u64),
+    RolloverVote(u64, Address),
+    CollateralVault(Address, u64),
+    DefaultedMembers(u64),
+    LeniencyStats(u64),
+    LeniencyRequest(u64),
+    Proposal(u64),
+    VotingPower(Address, u64),
+    DissolutionProposal(u64),
+    RefundClaim(u64),
 }
 
 #[contracttype]
@@ -234,6 +255,47 @@ pub enum RefundStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RolloverVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RolloverStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Rejected,
+    Applied,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RolloverBonus {
+    pub circle_id: u64,
+    pub bonus_amount: i128,
+    pub fee_percentage: u32, // Percentage of platform fee to refund
+    pub created_timestamp: u64,
+    pub status: RolloverStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub applied_cycle: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RolloverVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: RolloverVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct DissolvedCircle {
     pub circle_id: u64,
@@ -373,7 +435,19 @@ pub struct CircleInfo {
     pub nft_contract: Address,
     pub is_round_finalized: bool,
     pub current_pot_recipient: Option<Address>,
-
+    pub member_addresses: Vec<Address>,
+    pub requires_collateral: bool,
+    pub leniency_enabled: bool,
+    pub grace_period_end: Option<u64>,
+    pub quadratic_voting_enabled: bool,
+    pub proposal_count: u64,
+    pub dissolution_status: DissolutionStatus,
+    pub dissolution_deadline: Option<u64>,
+    pub proposed_late_fee_bps: u32,
+    pub proposal_votes_bitmap: u64,
+    pub recovery_old_address: Option<Address>,
+    pub recovery_new_address: Option<Address>,
+    pub recovery_votes_bitmap: u64,
 }
 
 // --- CONTRACT CLIENTS ---
@@ -457,6 +531,11 @@ pub trait SoroSusuTrait {
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
 
+    // Rollover Bonus Incentive Logic
+    fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32);
+    fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice);
+    fn apply_rollover_bonus(env: Env, circle_id: u64);
+
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
 }
@@ -486,47 +565,40 @@ fn write_audit(env: &Env, actor: &Address, action: AuditAction, resource_id: u64
     append_audit_index(env, DataKey::AuditAll, audit_count);
     append_audit_index(env, DataKey::AuditByActor(actor.clone()), audit_count);
     append_audit_index(env, DataKey::AuditByResource(resource_id), audit_count);
-        let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
-        circle_count += 1;
-
-        let new_circle = CircleInfo {
-            id: circle_count,
-            creator: creator.clone(),
-            contribution_amount: amount,
-            max_members,
-            member_count: 0,
-            current_recipient_index: 0,
-            is_active: true,
-            token,
-            deadline_timestamp: current_time + cycle_duration,
-            cycle_duration,
-            contribution_bitmap: 0,
-            insurance_balance: 0,
-            insurance_fee_bps,
-            is_insurance_used: false,
-            late_fee_bps: 100, // 1%
-            nft_contract,
-            is_round_finalized: false,
-            current_pot_recipient: None,
-            leniency_enabled: true,
-            grace_period_end: None,
-            quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
-            proposal_count: 0,
-            dissolution_status: DissolutionStatus::NotInitiated,
-            dissolution_deadline: None,
-        };
-        // Check if member is defaulted
-        let defaulted_key = DataKey::DefaultedMembers(circle_id);
-        let defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key).unwrap_or(Vec::new(&env));
-        
-        if !defaulted_members.contains(&member) {
-            panic!("Member not defaulted");
-        }
 
     env.events().publish(
         (symbol_short!("AUDIT"), actor.clone(), resource_id),
         (audit_count, entry.timestamp),
     );
+}
+
+fn append_audit_index(env: &Env, index_key: DataKey, audit_id: u64) {
+    let mut index: Vec<u64> = env.storage().instance().get(&index_key).unwrap_or(Vec::new(env));
+    index.push_back(audit_id);
+    env.storage().instance().set(&index_key, &index);
+}
+
+fn calculate_rollover_bonus(env: &Env, circle_id: u64, fee_percentage_bps: u32) -> i128 {
+    // Get the protocol fee settings
+    let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+    if fee_bps == 0 {
+        return 0; // No protocol fee, no bonus
+    }
+
+    // Calculate the total pot amount for this circle
+    let circle_key = DataKey::Circle(circle_id);
+    let circle: CircleInfo = env.storage().instance().get(&circle_key)
+        .expect("Circle not found");
+    
+    let total_pot = circle.contribution_amount * (circle.member_count as i128);
+    
+    // Calculate the platform fee that would be charged
+    let platform_fee = (total_pot * fee_bps as i128) / 10000;
+    
+    // Calculate the rollover bonus (percentage of platform fee to refund)
+    let bonus_amount = (platform_fee * fee_percentage_bps as i128) / 10000;
+    
+    bonus_amount
 }
 
 fn get_member_address_by_index(circle: &CircleInfo, index: u32) -> Address {
@@ -827,7 +899,19 @@ impl SoroSusuTrait for SoroSusu {
             nft_contract,
             is_round_finalized: false,
             current_pot_recipient: None,
-
+            member_addresses: Vec::new(&env),
+            requires_collateral,
+            leniency_enabled: true,
+            grace_period_end: None,
+            quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
+            proposal_count: 0,
+            dissolution_status: DissolutionStatus::NotInitiated,
+            dissolution_deadline: None,
+            proposed_late_fee_bps: 0,
+            proposal_votes_bitmap: 0,
+            recovery_old_address: None,
+            recovery_new_address: None,
+            recovery_votes_bitmap: 0,
         };
 
         env.storage()
@@ -920,7 +1004,8 @@ impl SoroSusuTrait for SoroSusu {
         let base_amount = circle.contribution_amount * member.tier_multiplier as i128;
         let mut penalty_amount = 0i128;
 
-
+        // Check if contribution is late
+        if current_time > circle.deadline_timestamp {
             let base_penalty = (base_amount * circle.late_fee_bps as i128) / 10000;
             // Apply referral discount
             let mut discount = 0i128;
@@ -935,7 +1020,17 @@ impl SoroSusuTrait for SoroSusu {
             let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
             reserve += penalty_amount;
             env.storage().instance().set(&DataKey::GroupReserve, &reserve);
-            
+        }
+
+        // Update user statistics
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let mut user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+
+        if penalty_amount > 0 {
             user_stats.late_contributions += 1;
         } else {
             user_stats.on_time_contributions += 1;
@@ -1045,17 +1140,36 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         let pot_amount = circle.contribution_amount * (circle.member_count as i128);
+        
+        // Check for rollover bonus and add to first pot of new cycles
+        let mut total_payout = pot_amount;
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        if let Some(rollover_bonus) = env.storage().instance().get::<DataKey, RolloverBonus>(&rollover_key) {
+            if rollover_bonus.status == RolloverStatus::Applied {
+                if let Some(applied_cycle) = rollover_bonus.applied_cycle {
+                    if applied_cycle == circle.current_recipient_index {
+                        total_payout += rollover_bonus.bonus_amount;
+                        
+                        env.events().publish(
+                            (Symbol::new(&env, "ROLLOVER_BONUS_APPLIED"), circle_id, user.clone()),
+                            (rollover_bonus.bonus_amount, applied_cycle),
+                        );
+                    }
+                }
+            }
+        }
+        
         let token_client = token::Client::new(&env, &circle.token);
         
         let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
         if fee_bps > 0 {
             let treasury: Address = env.storage().instance().get(&DataKey::ProtocolTreasury).expect("Treasury not set");
-            let fee = (pot_amount * fee_bps as i128) / 10000;
-            let net_payout = pot_amount - fee;
+            let fee = (total_payout * fee_bps as i128) / 10000;
+            let net_payout = total_payout - fee;
             token_client.transfer(&env.current_contract_address(), &treasury, &fee);
             token_client.transfer(&env.current_contract_address(), &user, &net_payout);
         } else {
-            token_client.transfer(&env.current_contract_address(), &user, &pot_amount);
+            token_client.transfer(&env.current_contract_address(), &user, &total_payout);
         }
 
         // Auto-release collateral if member has completed all contributions
@@ -1446,6 +1560,181 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
+    fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32) {
+        user.require_auth();
+
+        if fee_percentage_bps > 10000 {
+            panic!("Fee percentage cannot exceed 100%");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if there's already an active rollover proposal
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        if let Some(existing_rollover) = env.storage().instance().get::<DataKey, RolloverBonus>(&rollover_key) {
+            if existing_rollover.status == RolloverStatus::Voting {
+                panic!("Rollover bonus proposal already active");
+            }
+        }
+
+        // Only allow rollover proposals after the first round is complete
+        if !circle.is_round_finalized || circle.current_recipient_index == 0 {
+            panic!("Rollover can only be proposed after first complete cycle");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let bonus_amount = calculate_rollover_bonus(&env, circle_id, fee_percentage_bps);
+
+        let rollover_bonus = RolloverBonus {
+            circle_id,
+            bonus_amount,
+            fee_percentage: fee_percentage_bps,
+            created_timestamp: current_time,
+            status: RolloverStatus::Voting,
+            voting_deadline: current_time + ROLLOVER_VOTING_PERIOD,
+            for_votes: 0,
+            against_votes: 0,
+            total_votes_cast: 0,
+            applied_cycle: None,
+        };
+
+        env.storage().instance().set(&rollover_key, &rollover_bonus);
+        
+        // The proposer automatically votes for
+        let vote_key = DataKey::RolloverVote(circle_id, user.clone());
+        let vote = RolloverVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: RolloverVoteChoice::For,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        let mut updated_rollover = rollover_bonus;
+        updated_rollover.for_votes = 1;
+        updated_rollover.total_votes_cast = 1;
+        env.storage().instance().set(&rollover_key, &updated_rollover);
+
+        write_audit(&env, &user, AuditAction::DisputeSubmission, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ROLLOVER_PROPOSED"), circle_id, user.clone()),
+            (bonus_amount, fee_percentage_bps, updated_rollover.voting_deadline),
+        );
+    }
+
+    fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice) {
+        user.require_auth();
+
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        let mut rollover_bonus: RolloverBonus = env.storage().instance().get(&rollover_key)
+            .expect("No active rollover proposal");
+
+        if rollover_bonus.status != RolloverStatus::Voting {
+            panic!("Rollover proposal is not in voting period");
+        }
+
+        if env.ledger().timestamp() > rollover_bonus.voting_deadline {
+            rollover_bonus.status = RolloverStatus::Rejected;
+            env.storage().instance().set(&rollover_key, &rollover_bonus);
+            panic!("Voting period has expired");
+        }
+
+        // Check if user is an active member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::RolloverVote(circle_id, user.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Record the vote
+        let vote = RolloverVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: vote_choice.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        match vote_choice {
+            RolloverVoteChoice::For => rollover_bonus.for_votes += 1,
+            RolloverVoteChoice::Against => rollover_bonus.against_votes += 1,
+        }
+        rollover_bonus.total_votes_cast += 1;
+
+        // Check if voting criteria are met
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let active_members = count_active_members(&env, &circle);
+        
+        let quorum_met = (rollover_bonus.total_votes_cast * 100) >= (active_members * ROLLOVER_QUORUM);
+        
+        if quorum_met && rollover_bonus.total_votes_cast > 0 {
+            let approval_percentage = (rollover_bonus.for_votes * 100) / rollover_bonus.total_votes_cast;
+            if approval_percentage >= ROLLOVER_MAJORITY {
+                rollover_bonus.status = RolloverStatus::Approved;
+            }
+        }
+
+        env.storage().instance().set(&rollover_key, &rollover_bonus);
+        write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ROLLOVER_VOTE"), circle_id, user.clone()),
+            (vote_choice, rollover_bonus.for_votes, rollover_bonus.against_votes),
+        );
+    }
+
+    fn apply_rollover_bonus(env: Env, circle_id: u64) {
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        let mut rollover_bonus: RolloverBonus = env.storage().instance().get(&rollover_key)
+            .expect("No rollover bonus proposal found");
+
+        if rollover_bonus.status != RolloverStatus::Approved {
+            panic!("Rollover bonus is not approved");
+        }
+
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+
+        // Apply the bonus to the group reserve (will be used in next cycle's first pot)
+        let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        reserve += rollover_bonus.bonus_amount;
+        env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+
+        // Mark as applied and track the cycle
+        rollover_bonus.status = RolloverStatus::Applied;
+        rollover_bonus.applied_cycle = Some(circle.current_recipient_index + 1);
+        env.storage().instance().set(&rollover_key, &rollover_bonus);
+
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ROLLOVER_APPLIED"), circle_id),
+            (rollover_bonus.bonus_amount, rollover_bonus.applied_cycle.unwrap()),
+        );
+    }
+
     #[test]
     fn test_get_reputation() {
         let env = Env::default();
@@ -1635,5 +1924,129 @@ impl SoroSusuTrait for SoroSusu {
         client.deposit(&user, &circle_id);
         client.finalize_round(&creator, &circle_id);
         client.claim_pot(&user, &circle_id); // debt is deducted seamlessly!
+    }
+
+    #[test]
+    fn test_rollover_bonus_proposal_and_voting() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Set up protocol fee for rollover bonus calculation
+        client.set_protocol_fee(&admin, &100, &admin); // 1% fee
+        
+        // Create circle with 2 members
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens
+            &2,
+            &token_contract,
+            &86400,
+            &100, // 1% insurance
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user1, &circle_id);
+        
+        // Now propose rollover bonus (50% of platform fee)
+        client.propose_rollover_bonus(&creator, &circle_id, &5000);
+        
+        // Second member votes for the rollover
+        client.vote_rollover_bonus(&user1, &circle_id, &RolloverVoteChoice::For);
+        
+        // Apply the rollover bonus
+        client.apply_rollover_bonus(&circle_id);
+        
+        // Start third cycle - first recipient should get rollover bonus
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Check that rollover bonus is applied to payout
+        let initial_balance = token_contract.mock_balance(&creator);
+        client.claim_pot(&creator, &circle_id);
+        let final_balance = token_contract.mock_balance(&creator);
+        
+        // Should receive regular pot (2000) minus fee (1% = 20) plus rollover bonus (50% of fee = 10)
+        let expected_payout = 2000 - 20 + 10; // 1990
+        assert_eq!(final_balance - initial_balance, expected_payout);
+    }
+
+    #[test]
+    fn test_rollover_bonus_rejection() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        client.set_protocol_fee(&admin, &100, &admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &2,
+            &token_contract,
+            &86400,
+            &100,
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Propose rollover bonus
+        client.propose_rollover_bonus(&creator, &circle_id, &5000);
+        
+        // Second member votes against - should not meet majority threshold
+        client.vote_rollover_bonus(&user1, &circle_id, &RolloverVoteChoice::Against);
+        
+        // Try to apply should fail since not approved
+        std::panic::catch_unwind(|| {
+            client.apply_rollover_bonus(&circle_id);
+        }).expect_err("Should panic when trying to apply unapproved rollover");
     }
 }
