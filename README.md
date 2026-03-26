@@ -8,10 +8,11 @@ A trustless Rotating Savings and Credit Association (ROSCA) built on Stellar Sor
 
 ## Features
 - Create savings circles with fixed contribution amounts
-- Join existing circles
+- Join existing circles with flexible shares (1x or 2x contributions)
 - Deposit USDC/XLM securely
-- Automated payouts (Coming Soon)
+- Automated payouts with double rewards for 2-share members
 - Immutable audit log for sensitive actions
+- Family and small business friendly participation options
 
 ## Audit Log
 
@@ -53,6 +54,31 @@ The protocol takes a configurable fee from every payout (e.g. 0.5%).
 - Payouts deduct the fee from the payout amount: the recipient receives `payout_amount - fee`, and the fee is transferred to `treasury_address`.
 
 After deploy, call `initialize(admin)` once, then `set_protocol_fee(fee_basis_points, treasury)` to enable fees. When implementing the payout flow, use `compute_and_transfer_payout(env, token, from, recipient, gross_payout)` so every payout is fee-deducted and the fee is sent to the treasury.
+
+## Shares Feature
+
+The SoroSusu protocol now supports flexible shares, allowing members to participate at different contribution levels:
+
+### Standard Shares (1 Share)
+- Contribute the standard amount each cycle
+- Receive the standard pot payout
+- Ideal for individual participants
+
+### Double Shares (2 Shares)  
+- Contribute 2x the standard amount each cycle
+- Receive 2x the pot payout
+- Perfect for families or small businesses
+
+### Example
+```
+Circle: 100 USDC contribution, 3 members
+- Member A (1 share): contributes 100 USDC, receives 400 USDC pot
+- Member B (2 shares): contributes 200 USDC, receives 800 USDC pot  
+- Member C (1 share): contributes 100 USDC, receives 400 USDC pot
+Total pot: 400 USDC (based on 4 total shares)
+```
+
+This makes SoroSusu a one-size-fits-all tool for communal finance, accommodating both individual savers and larger entities within the same cycle.
 
 ## How to Build
 ```bash
