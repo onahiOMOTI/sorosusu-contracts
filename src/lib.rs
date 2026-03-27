@@ -1,58 +1,8 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, token, panic, Map, Vec, i128, u64, u32};
 
-mod sbt_minter;
+mod lending_market;
 
-pub use sbt_minter::*;
-
-// --- SOROSUSU SOULBOUND TOKEN (SBT) SYSTEM ---
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum SbtStatus {
-    Active,
-    Dishonored,
-    Revoked,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum ReputationTier {
-    Bronze,     // 0-2 cycles completed
-    Silver,     // 3-5 cycles completed  
-    Gold,       // 6-9 cycles completed
-    Platinum,   // 10+ cycles completed
-    Diamond,    // Legendary: 12+ cycles with perfect record
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct SoroSusuCredential {
-    pub token_id: u128,
-    pub holder: Address,
-    pub reputation_tier: ReputationTier,
-    pub total_cycles_completed: u32,
-    pub perfect_cycles: u32,
-    pub on_time_rate: u32,        // Basis points (10000 = 100%)
-    pub reliability_score: u32,     // 0-10000 bps
-    pub social_capital_score: u32,  // 0-10000 bps
-    pub total_volume_saved: i128,
-    pub last_activity: u64,
-    pub status: SbtStatus,
-    pub minted_timestamp: u64,
-    pub metadata_uri: String,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct ReputationMilestone {
-    pub milestone_id: u64,
-    pub user: Address,
-    pub cycles_required: u32,
-    pub description: String,
-    pub is_completed: bool,
-    pub completion_timestamp: Option<u64>,
-    pub reward_tier: ReputationTier,
-}
+pub use lending_market::*;
 
 // --- DATA STRUCTURES ---
 
@@ -250,14 +200,48 @@ const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
 const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
 const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
 
+// Lending Market Constants
+const LENDING_MARKET_VOTING_PERIOD: u64 = 86400; // 24 hours for lending market decisions
+const LENDING_MARKET_QUORUM: u32 = 60; // 60% quorum for major lending decisions
+const LENDING_MARKET_MAJORITY: u32 = 75; // 75% supermajority for lending market changes
+const LENDING_MARKET_MIN_PARTICIPATION: u32 = 40; // 40% minimum participation for validity
+const LENDING_MARKET_EMERGENCY_PERIOD: u64 = 21600; // 6 hours for emergency proposals
+const LENDING_MARKET_EMERGENCY_QUORUM: u32 = 80; // 80% supermajority for emergency actions
+
+// Lending pool configuration
+const MIN_LENDING_AMOUNT: i128 = 100_000_000; // Minimum 10 tokens to lend
+const MAX_LENDING_AMOUNT: i128 = 10_000_000_000; // Maximum 10,000 tokens per pool
+const MIN_LENDING_PARTICIPATION: u32 = 5; // Minimum 5 participants in a lending pool
+const MAX_LENDING_PARTICIPATION: u32 = 20; // Maximum 20 participants per pool
+const MIN_POOL_UTILIZATION: u32 = 2000; // Minimum 20% of pool must be utilized
+const DEFAULT_LENDING_FEE_BPS: u32 = 100; // 1% lending fee to pool
+const MIN_CREDIT_SCORE: u32 = 3000; // Minimum 30% credit score to participate
+const MAX_LENDING_DURATION: u64 = 1209600; // Maximum 14 days (2 weeks) for loans
+
+// Interest rate calculations
+const BASE_INTEREST_RATE_BPS: u32 = 500; // 5% base annual interest rate
+const CREDIT_SCORE_DISCOUNT_BPS: u32 = 10; // 0.1% discount per credit score point above 3000
+const MIN_INTEREST_RATE_BPS: u32 = 100; // 1% minimum interest rate
+const MAX_INTEREST_RATE_BPS: u32 = 2000; // 20% maximum interest rate
+
+// Risk assessment constants
+const DEFAULT_LTV_RATIO: u32 = 7000; // 70% loan-to-value ratio
+const HIGH_RISK_LTV_PENALTY: u32 = 1000; // 10% LTV penalty for high-risk borrowers
+const MAX_LTV_RATIO: u32 = 9000; // 90% maximum LTV ratio
+
+// Yield farming for liquidity providers
+const LIQUIDITY_PROVIDER_YIELD_BPS: u32 = 200; // 2% annual yield for liquidity providers
+const MIN_LIQUIDITY_LOCK: u64 = 1209600; // 14 days minimum lock period
+const YIELD_COMPOUNDING_FREQUENCY: u64 = 604800; // Weekly compounding
+
 // Asset Swap / Economic Circuit Breaker Constants
 const PRICE_DROP_THRESHOLD_BPS: u32 = 2000; // 20% price drop triggers circuit breaker
 const ASSET_SWAP_VOTING_PERIOD: u64 = 86400; // 24 hours for asset swap voting
 const ASSET_SWAP_QUORUM: u32 = 60; // 60% quorum for asset swap approval
 const ASSET_SWAP_MAJORITY: u32 = 66; // 66% majority for asset swap approval
-const DEFAULT_HARD_ASSET_GOLD_WEIGHT: u32 = 5000; // 50% gold
-const DEFAULT_HARD_ASSET_BTC_WEIGHT: u32 = 3000; // 30% BTC
-const DEFAULT_HARD_ASSET_SILVER_WEIGHT: u32 = 2000; // 20% silver
+const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
+const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
+const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
 
 // --- DATA STRUCTURES ---
 
@@ -323,10 +307,30 @@ pub enum DataKey {
     MilestoneReached(u64),
     PaymentTiming(u64, u32, Address), // Payment timing per circle, round, and member
     PaymentOrderCounter(u64, u32), // Counter to track payment order in each round
+    // SBT Credential System Storage
+    SoroSusuCredential(u128),    // Token ID -> Credential mapping
+    UserCredential(Address),        // User -> Their SBT
+    ReputationMilestone(u64),      // Milestone ID -> Milestone data
+    MilestoneCounter,              // Counter for generating milestone IDs
+    UserReputationScore(Address),    // User -> Reputation metrics
+    SbtMinterAdmin,              // Admin address for SBT operations
     // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
     AnchorRegistry, // Registry of authorized anchors
     AnchorDeposit(u64), // Track anchor deposits per circle
     DepositMemo(u64), // Track deposit memos for compliance
+    // Inter-Susu Lending Market Liquidity Hook
+    LendingMarketProposal(u64),       // Lending market proposals
+    LendingMarketVote(u64, Address),       // Votes on lending market proposals
+    LendingPoolInfo(u64),             // Lending pool information
+    LendingPoolParticipant(u64, Address), // Pool participants
+    LendingMarketConfig,               // Global lending market configuration
+    LendingPosition(u64, Address),        // Individual lending positions
+    LendingOffer(u64),                 // Active lending offers
+    LiquidityProvider(u64, Address),     // Liquidity provider information
+    YieldFarm(u64),                   // Yield farming positions
+    EmergencyLoan(u64),                 // Emergency loan requests
+    RepaymentSchedule(u64),            // Loan repayment schedules
+    LendingMarketStats,               // Lending market statistics
 }
 
 #[contracttype]
@@ -1059,9 +1063,55 @@ pub trait LendingPoolTrait {
 }
 
 pub trait SoroSusuTrait {
+    // Initialize contract
     fn init(env: Env, admin: Address);
     fn set_lending_pool(env: Env, admin: Address, pool: Address);
     fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address);
+
+    // --- INTER-SUSU LENDING MARKET LIQUIDITY HOOK ---
+    fn init_lending_market(env: Env, admin: Address);
+    fn create_lending_pool(
+        env: Env,
+        lender_circle_id: u64,
+        borrower_circle_id: u64,
+        initial_liquidity: i128,
+    ) -> u64;
+    fn lend_from_pool(
+        env: Env,
+        pool_id: u64,
+        borrower: Address,
+        amount: i128,
+        loan_duration: u64,
+    ) -> u64;
+    fn add_liquidity(
+        env: Env,
+        pool_id: u64,
+        provider: Address,
+        amount: i128,
+        lock_duration: u64,
+    ) -> u64;
+    fn process_repayment(
+        env: Env,
+        position_id: u64,
+        payment_amount: i128,
+    );
+    fn get_lending_pool(env: Env, pool_id: u64) -> LendingPoolInfo;
+    fn get_lending_position(env: Env, position_id: u64) -> LendingPosition;
+    fn get_repayment_schedule(env: Env, schedule_id: u64) -> RepaymentSchedule;
+    fn get_lending_market_stats(env: Env) -> LendingMarketStats;
+    fn request_emergency_loan(
+        env: Env,
+        requester_circle_id: u64,
+        borrower_circle_id: u64,
+        amount: i128,
+        reason: String,
+    ) -> u64;
+    fn vote_emergency_loan(
+        env: Env,
+        loan_id: u64,
+        vote: LendingVoteChoice,
+    );
+    fn get_emergency_loan(env: Env, loan_id: u64) -> EmergencyLoan;
 
     fn create_circle(
         env: Env,
