@@ -1,5 +1,59 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, token, panic, Map, Vec, i128, u64, u32};
 
+mod sbt_minter;
+
+pub use sbt_minter::*;
+
+// --- SOROSUSU SOULBOUND TOKEN (SBT) SYSTEM ---
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum SbtStatus {
+    Active,
+    Dishonored,
+    Revoked,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum ReputationTier {
+    Bronze,     // 0-2 cycles completed
+    Silver,     // 3-5 cycles completed  
+    Gold,       // 6-9 cycles completed
+    Platinum,   // 10+ cycles completed
+    Diamond,    // Legendary: 12+ cycles with perfect record
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SoroSusuCredential {
+    pub token_id: u128,
+    pub holder: Address,
+    pub reputation_tier: ReputationTier,
+    pub total_cycles_completed: u32,
+    pub perfect_cycles: u32,
+    pub on_time_rate: u32,        // Basis points (10000 = 100%)
+    pub reliability_score: u32,     // 0-10000 bps
+    pub social_capital_score: u32,  // 0-10000 bps
+    pub total_volume_saved: i128,
+    pub last_activity: u64,
+    pub status: SbtStatus,
+    pub minted_timestamp: u64,
+    pub metadata_uri: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationMilestone {
+    pub milestone_id: u64,
+    pub user: Address,
+    pub cycles_required: u32,
+    pub description: String,
+    pub is_completed: bool,
+    pub completion_timestamp: Option<u64>,
+    pub reward_tier: ReputationTier,
+}
+
 // --- DATA STRUCTURES ---
 
 #[derive(Clone)]
@@ -54,6 +108,17 @@ pub enum DataKey {
     GasBufferConfig(u64),  // Per-circle gas buffer config
     ProtocolConfig,
     ScheduledPayoutTime(u64),
+    // SBT Credential System Storage
+    SoroSusuCredential(u128),    // Token ID -> Credential mapping
+    UserCredential(Address),        // User -> Their SBT
+    ReputationMilestone(u64),      // Milestone ID -> Milestone data
+    MilestoneCounter,              // Counter for generating milestone IDs
+    UserReputationScore(Address),    // User -> Reputation metrics
+    SbtMinterAdmin,              // Admin address for SBT operations
+    // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
+    AnchorRegistry, // Registry of authorized anchors
+    AnchorDeposit(u64), // Track anchor deposits per circle
+    DepositMemo(u64), // Track deposit memos for compliance
 }
 
 // --- CONTRACT TRAIT ---
@@ -937,7 +1002,34 @@ pub trait SoroSusuTrait {
     fn get_circle(env: Env, circle_id: u64) -> CircleInfo;
     fn get_member(env: Env, member: Address) -> Member;
     fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address>;
+
+    // --- SBT CREDENTIAL SYSTEM FUNCTIONS ---
+    fn init_sbt_minter(env: Env, admin: Address);
+    fn set_sbt_minter_admin(env: Env, admin: Address, new_admin: Address);
+    fn issue_credential(
+        env: Env,
+        user: Address,
+        milestone_id: u64,
+        metadata_uri: String,
+    ) -> u128;
+    fn update_credential_status(
+        env: Env,
+        token_id: u128,
+        new_status: SbtStatus,
+    );
+    fn revoke_credential(env: Env, token_id: u128, reason: String);
+    fn get_credential(env: Env, token_id: u128) -> SoroSusuCredential;
+    fn get_user_credential(env: Env, user: Address) -> Option<SoroSusuCredential>;
+    fn get_reputation_milestone(env: Env, milestone_id: u64) -> ReputationMilestone;
+    fn create_reputation_milestone(
+        env: Env,
+        user: Address,
+        cycles_required: u32,
+        description: String,
+        reward_tier: ReputationTier,
     ) -> u64;
+    fn update_user_reputation(env: Env, user: Address);
+    fn get_user_reputation_score(env: Env, user: Address) -> (u32, u32, u32);
 
     fn join_circle(
         env: Env,
