@@ -58,6 +58,17 @@ pub enum DataKey {
     GasBufferConfig(u64),  // Per-circle gas buffer config
     ProtocolConfig,
     ScheduledPayoutTime(u64),
+    // SBT Credential System Storage
+    SoroSusuCredential(u128),    // Token ID -> Credential mapping
+    UserCredential(Address),        // User -> Their SBT
+    ReputationMilestone(u64),      // Milestone ID -> Milestone data
+    MilestoneCounter,              // Counter for generating milestone IDs
+    UserReputationScore(Address),    // User -> Reputation metrics
+    SbtMinterAdmin,              // Admin address for SBT operations
+    // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
+    AnchorRegistry, // Registry of authorized anchors
+    AnchorDeposit(u64), // Track anchor deposits per circle
+    DepositMemo(u64), // Track deposit memos for compliance
 }
 
 // --- CONTRACT TRAIT ---
@@ -72,11 +83,51 @@ pub trait SoroSusuTrait {
         creator: Address,
         contribution_amount: u64,
         max_members: u16,
-#![no_std]
-use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec,
-};
+        token: Address,
+        cycle_duration: u64,
+        insurance_fee_bps: u32,
+        nft_contract: Address,
+        arbitrator: Address,
+        organizer_fee_bps: u32,
+    ) -> u64;
+
+    // Join an existing circle
+    fn join_circle(env: Env, user: Address, circle_id: u64);
+
+    // Make a deposit (Pay your weekly/monthly due)
+    fn deposit(env: Env, user: Address, circle_id: u64);
+
+    // NEW: Gas buffer management functions
+    fn fund_gas_buffer(env: Env, circle_id: u64, amount: i128);
+    fn set_gas_buffer_config(env: Env, circle_id: u64, config: GasBufferConfig);
+    fn get_gas_buffer_balance(env: Env, circle_id: u64) -> i128;
+
+    // NEW: Payout functions with gas buffer support
+    fn distribute_payout(env: Env, caller: Address, circle_id: u64);
+    fn trigger_payout(env: Env, admin: Address, circle_id: u64);
+    fn finalize_round(env: Env, creator: Address, circle_id: u64);
+
+    // Helper functions
+    fn get_circle(env: Env, circle_id: u64) -> CircleInfo;
+    fn get_member(env: Env, member: Address) -> Member;
+    fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address>;
+
+    // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
+    fn register_anchor(env: Env, admin: Address, anchor_info: AnchorInfo);
+    fn deposit_for_user(
+        env: Env,
+        anchor: Address,
+        beneficiary_user: Address,
+        circle_id: u64,
+        amount: i128,
+        deposit_memo: String,
+        fiat_reference: String,
+        sep_type: String,
+    );
+    fn verify_anchor_deposit(env: Env, deposit_id: u64) -> bool;
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo;
+    fn get_deposit_record(env: Env, deposit_id: u64) -> AnchorDeposit;
+}
 
 // --- ERROR CODES ---
 
@@ -101,6 +152,11 @@ pub enum Error {
     InvalidBasketWeights = 15,
     BasketNotEnabled = 16,
     InvalidBasketRatio = 17,
+    AnchorNotFound = 18,
+    AnchorNotAuthorized = 19,
+    InvalidDepositMemo = 20,
+    DepositAlreadyProcessed = 21,
+    ComplianceCheckFailed = 22,
 }
 
 // --- CONSTANTS ---
@@ -896,6 +952,51 @@ pub struct PaymentTimingRecord {
     pub payment_order: u32, // Order in which this payment was made (1 = first, 2 = second, etc.)
 }
 
+/// Stellar Anchor Information - SEP-24/SEP-31 compliant anchor registry
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorInfo {
+    pub anchor_address: Address,
+    pub anchor_name: String,
+    pub sep_version: String, // "SEP-24" or "SEP-31"
+    pub authorization_level: u32, // 1=Basic, 2=Enhanced, 3=Full
+    pub compliance_level: u32, // 1=Basic KYC, 2=Enhanced KYC, 3=Full KYC+AML
+    pub is_active: bool,
+    pub registration_timestamp: u64,
+    pub last_activity: u64,
+    pub supported_countries: Vec<String>, // ISO country codes
+    pub max_deposit_amount: i128,
+    pub daily_deposit_limit: i128,
+}
+
+/// Anchor Deposit Record - Track deposits made by anchors on behalf of users
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnchorDeposit {
+    pub deposit_id: u64,
+    pub anchor_address: Address,
+    pub beneficiary_user: Address,
+    pub circle_id: u64,
+    pub amount: i128,
+    pub deposit_memo: String, // Unique identifier for compliance
+    pub fiat_reference: String, // Reference to fiat transaction
+    pub timestamp: u64,
+    pub compliance_verified: bool,
+    pub processed: bool,
+    pub sep_type: String, // "SEP-24" or "SEP-31"
+}
+
+/// Deposit Memo Structure - Standardized format for compliance
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepositMemo {
+    pub memo_type: String, // "text", "hash", or "return"
+    pub memo_value: String,
+    pub anchor_id: String,
+    pub transaction_hash: Option<String>, // For blockchain reference
+    pub compliance_data: String, // Encrypted compliance information
+}
+
 
 // --- CONTRACT CLIENTS ---
 
@@ -1045,7 +1146,34 @@ pub trait SoroSusuTrait {
     fn get_circle(env: Env, circle_id: u64) -> CircleInfo;
     fn get_member(env: Env, member: Address) -> Member;
     fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address>;
+
+    // --- SBT CREDENTIAL SYSTEM FUNCTIONS ---
+    fn init_sbt_minter(env: Env, admin: Address);
+    fn set_sbt_minter_admin(env: Env, admin: Address, new_admin: Address);
+    fn issue_credential(
+        env: Env,
+        user: Address,
+        milestone_id: u64,
+        metadata_uri: String,
+    ) -> u128;
+    fn update_credential_status(
+        env: Env,
+        token_id: u128,
+        new_status: SbtStatus,
+    );
+    fn revoke_credential(env: Env, token_id: u128, reason: String);
+    fn get_credential(env: Env, token_id: u128) -> SoroSusuCredential;
+    fn get_user_credential(env: Env, user: Address) -> Option<SoroSusuCredential>;
+    fn get_reputation_milestone(env: Env, milestone_id: u64) -> ReputationMilestone;
+    fn create_reputation_milestone(
+        env: Env,
+        user: Address,
+        cycles_required: u32,
+        description: String,
+        reward_tier: ReputationTier,
     ) -> u64;
+    fn update_user_reputation(env: Env, user: Address);
+    fn get_user_reputation_score(env: Env, user: Address) -> (u32, u32, u32);
 
     fn join_circle(
         env: Env,
@@ -1942,13 +2070,13 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn get_member(env: Env, member: Address) -> Member {
-        env.storage::instance()
+        env.storage().instance()
             .get(&DataKey::Member(member))
             .unwrap_or_else(|| panic!("Member not found"))
     }
 
     fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address> {
-        let circle: CircleInfo = env.storage::instance()
+        let circle: CircleInfo = env.storage().instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
@@ -1963,8 +2091,225 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         let recipient_index = circle.current_round % (circle.current_members as u32);
-        env.storage::instance()
+        env.storage().instance()
             .get(&DataKey::MemberByIndex(circle_id, recipient_index))
+    }
+
+    // --- STELLAR ANCHOR DIRECT DEPOSIT API (SEP-24/SEP-31) ---
+
+    fn register_anchor(env: Env, admin: Address, anchor_info: AnchorInfo) {
+        // Only admin can register anchors
+        admin.require_auth();
+        
+        // Verify admin is contract admin
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not found"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: Only admin can register anchors");
+        }
+
+        // Store anchor info in registry
+        let mut anchor_registry: Map<Address, AnchorInfo> = env.storage().instance()
+            .get(&DataKey::AnchorRegistry)
+            .unwrap_or_else(|| Map::new(&env));
+        
+        anchor_registry.set(anchor_info.anchor_address.clone(), anchor_info.clone());
+        env.storage().instance().set(&DataKey::AnchorRegistry, &anchor_registry);
+
+        // Log audit entry
+        let audit_count: u64 = env.storage().instance()
+            .get(&DataKey::AuditCount)
+            .unwrap_or(0);
+        
+        let audit_entry = AuditEntry {
+            id: audit_count,
+            actor: admin,
+            action: AuditAction::AdminAction,
+            timestamp: env.ledger().timestamp(),
+            resource_id: 0, // Use 0 for anchor registration
+        };
+        
+        env.storage().instance().set(&DataKey::AuditEntry(audit_count), &audit_entry);
+        env.storage().instance().set(&DataKey::AuditCount, &(audit_count + 1));
+    }
+
+    fn deposit_for_user(
+        env: Env,
+        anchor: Address,
+        beneficiary_user: Address,
+        circle_id: u64,
+        amount: i128,
+        deposit_memo: String,
+        fiat_reference: String,
+        sep_type: String,
+    ) {
+        // Authorization: The anchor must sign this!
+        anchor.require_auth();
+
+        // Verify anchor is registered and authorized
+        let anchor_registry: Map<Address, AnchorInfo> = env.storage::instance()
+            .get(&DataKey::AnchorRegistry)
+            .unwrap_or_else(|| panic!("Anchor registry not found"));
+        
+        let anchor_info: AnchorInfo = anchor_registry.get(anchor.clone())
+            .unwrap_or_else(|| panic!("Anchor not found"));
+
+        if !anchor_info.is_active {
+            panic!("Anchor not active");
+        }
+
+        // Verify SEP type is supported
+        if sep_type != "SEP-24" && sep_type != "SEP-31" {
+            panic!("Unsupported SEP type");
+        }
+
+        // Compliance checks
+        if amount > anchor_info.max_deposit_amount {
+            panic!("Amount exceeds anchor's maximum deposit limit");
+        }
+
+        // Check if deposit memo already processed (prevent double processing)
+        let memo_key = DataKey::DepositMemo(circle_id);
+        let mut processed_memos: Vec<String> = env.storage::instance()
+            .get(&memo_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        if processed_memos.contains(&deposit_memo) {
+            panic!("Deposit already processed");
+        }
+
+        // Get the circle
+        let mut circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Get the member
+        let mut member: Member = env.storage().instance()
+            .get(&DataKey::Member(beneficiary_user.clone()))
+            .unwrap_or_else(|| panic!("Member not found"));
+
+        // Check if already contributed this round
+        if member.has_contributed_current_round {
+            panic!("Already contributed this round");
+        }
+
+        // Calculate the total amount needed (contribution + insurance fee + group insurance premium)
+        let insurance_fee = (circle.contribution_amount as i128 * circle.insurance_fee_bps as i128) / 10_000;
+        let group_insurance_premium = (circle.contribution_amount as i128 * 50i128) / 10_000;
+        let total_amount = circle.contribution_amount as i128 + insurance_fee + group_insurance_premium;
+
+        // Verify amount matches expected contribution
+        if amount != total_amount {
+            panic!("Amount does not match required contribution");
+        }
+
+        // Create deposit record
+        let deposit_id = env.ledger().sequence(); // Use ledger sequence as unique ID
+        let deposit_record = AnchorDeposit {
+            deposit_id,
+            anchor_address: anchor.clone(),
+            beneficiary_user: beneficiary_user.clone(),
+            circle_id,
+            amount,
+            deposit_memo: deposit_memo.clone(),
+            fiat_reference,
+            timestamp: env.ledger().timestamp(),
+            compliance_verified: true,
+            processed: false,
+            sep_type,
+        };
+
+        // Store deposit record
+        env.storage().instance().set(&DataKey::AnchorDeposit(deposit_id), &deposit_record);
+
+        // Mark memo as processed
+        processed_memos.push_back(deposit_memo);
+        env.storage().instance().set(&memo_key, &processed_memos);
+
+        // Transfer the tokens from anchor to contract
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&anchor, &env.current_contract_address(), &total_amount);
+
+        // Update member record (similar to regular deposit)
+        member.has_contributed_current_round = true;
+        member.last_contribution_time = env.ledger().timestamp();
+        member.contribution_count += 1;
+        member.total_contributions += total_amount;
+
+        // Update user stats
+        let mut user_stats: UserStats = env.storage().instance()
+            .get(&DataKey::UserStats(beneficiary_user.clone()))
+            .unwrap_or_else(|| UserStats {
+                total_volume_saved: 0,
+                on_time_contributions: 0,
+                late_contributions: 0,
+            });
+        
+        user_stats.total_volume_saved += total_amount;
+        user_stats.on_time_contributions += 1;
+        env.storage().instance().set(&DataKey::UserStats(beneficiary_user.clone()), &user_stats);
+
+        // Store the updated member
+        env.storage().instance().set(&DataKey::Member(beneficiary_user.clone()), &member);
+
+        // Update circle contribution bitmap
+        let member_index = member.index;
+        circle.contribution_bitmap |= 1u64 << member_index;
+
+        // Store the updated circle
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Update anchor's last activity
+        let mut updated_anchor_info = anchor_info.clone();
+        updated_anchor_info.last_activity = env.ledger().timestamp();
+        anchor_registry.set(anchor.clone(), updated_anchor_info);
+        env.storage().instance().set(&DataKey::AnchorRegistry, &anchor_registry);
+
+        // Mark deposit as processed
+        let mut updated_deposit = deposit_record;
+        updated_deposit.processed = true;
+        env.storage().instance().set(&DataKey::AnchorDeposit(deposit_id), &updated_deposit);
+
+        // Log audit entry
+        let audit_count: u64 = env.storage::instance()
+            .get(&DataKey::AuditCount)
+            .unwrap_or(0);
+        
+        let audit_entry = AuditEntry {
+            id: audit_count,
+            actor: anchor,
+            action: AuditAction::AdminAction, // Use AdminAction for anchor deposits
+            timestamp: env.ledger().timestamp(),
+            resource_id: circle_id,
+        };
+        
+        env.storage().instance().set(&DataKey::AuditEntry(audit_count), &audit_entry);
+        env.storage().instance().set(&DataKey::AuditCount, &(audit_count + 1));
+    }
+
+    fn verify_anchor_deposit(env: Env, deposit_id: u64) -> bool {
+        let deposit: AnchorDeposit = env.storage().instance()
+            .get(&DataKey::AnchorDeposit(deposit_id))
+            .unwrap_or_else(|| panic!("Deposit not found"));
+        
+        deposit.processed && deposit.compliance_verified
+    }
+
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo {
+        let anchor_registry: Map<Address, AnchorInfo> = env.storage::instance()
+            .get(&DataKey::AnchorRegistry)
+            .unwrap_or_else(|| panic!("Anchor registry not found"));
+        
+        anchor_registry.get(anchor_address)
+            .unwrap_or_else(|| panic!("Anchor not found"))
+    }
+
+    fn get_deposit_record(env: Env, deposit_id: u64) -> AnchorDeposit {
+        env.storage().instance()
+            .get(&DataKey::AnchorDeposit(deposit_id))
+            .unwrap_or_else(|| panic!("Deposit not found"))
     }
 
     // --- INTERNAL HELPER FUNCTIONS ---
@@ -2094,31 +2439,6 @@ impl SoroSusuTrait for SoroSusu {
             let mut member_info: Member = env.storage::instance()
                 .get(&DataKey::Member(member))
                 .unwrap_or_else(|| panic!("Member not found"));
-            
-            member_info.has_contributed_current_round = false;
-            env.storage::instance().set(&DataKey::Member(member), &member_info);
-        }
-
-        env.storage::instance().set(&DataKey::Circle(circle_id), &circle);
-    ) -> u64 {
-        creator.require_auth();
-        if max_members == 0 {
-            panic!("Max members must be greater than zero");
-        }
-
-        let current_time = env.ledger().timestamp();
-        let rate_limit_key = DataKey::LastCreatedTimestamp(creator.clone());
-        if let Some(last_created) = env.storage().instance().get::<DataKey, u64>(&rate_limit_key) {
-            if current_time < last_created + RATE_LIMIT_SECONDS {
-                panic!("Rate limit exceeded");
-            }
-        }
-        env.storage().instance().set(&rate_limit_key, &current_time);
-
-        let mut circle_count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CircleCount)
             .unwrap_or(0);
         circle_count += 1;
 
@@ -3524,7 +3844,7 @@ impl SoroSusuTrait for SoroSusu {
         match vote_choice {
             QuadraticVoteChoice::For => proposal.for_votes += vote_weight,
             QuadraticVoteChoice::Against => proposal.against_votes += vote_weight,
-            QuadraticVoteChoice::Abstain => { /* Abstain doesn't count */ }
+            QuadraticVoteChoice::Abstain => { /* Abstain doesn't count */ () },
         }
         
         proposal.total_votes_cast += vote_weight;
