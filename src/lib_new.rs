@@ -237,7 +237,7 @@ impl SoroSusuTrait for SoroSusu {
             .unwrap_or_else(|| panic!("Circle not found"));
 
         // Get the member
-        let mut member: Member = env.storage().instance()
+        let mut member: Member = env.storage::instance()
             .get(&DataKey::Member(user.clone()))
             .unwrap_or_else(|| panic!("Member not found"));
 
@@ -263,8 +263,8 @@ impl SoroSusuTrait for SoroSusu {
         circle.contributions.set(user.clone(), true);
 
         // Store updated records
-        env.storage().instance().set(&DataKey::Member(user), &member);
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage::instance().set(&DataKey::Member(user), &member);
+        env.storage::instance().set(&DataKey::Circle(circle_id), &circle);
 
         // Check if all members have contributed and auto-finalize if so
         Self::check_and_finalize_round(&env, circle_id);
@@ -274,12 +274,12 @@ impl SoroSusuTrait for SoroSusu {
 
     fn fund_gas_buffer(env: Env, circle_id: u64, amount: i128) {
         // Get the circle
-        let mut circle: CircleInfo = env.storage().instance()
+        let mut circle: CircleInfo = env.storage::instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
         // Get gas buffer config
-        let config: GasBufferConfig = env.storage().instance()
+        let config: GasBufferConfig = env.storage::instance()
             .get(&DataKey::GasBufferConfig(circle_id))
             .unwrap_or_else(|| panic!("Gas buffer config not found"));
 
@@ -301,7 +301,7 @@ impl SoroSusuTrait for SoroSusu {
         circle.gas_buffer_balance += amount;
 
         // Store updated circle
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage::instance().set(&DataKey::Circle(circle_id), &circle);
 
         // Emit event for gas buffer funding
         env.events().publish(
@@ -312,7 +312,7 @@ impl SoroSusuTrait for SoroSusu {
 
     fn set_gas_buffer_config(env: Env, circle_id: u64, config: GasBufferConfig) {
         // Only circle creator can set config
-        let circle: CircleInfo = env.storage().instance()
+        let circle: CircleInfo = env.storage::instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
@@ -325,7 +325,7 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         // Store the configuration
-        env.storage().instance().set(&DataKey::GasBufferConfig(circle_id), &config);
+        env.storage::instance().set(&DataKey::GasBufferConfig(circle_id), &config);
 
         // Emit event
         env.events().publish(
@@ -335,7 +335,7 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn get_gas_buffer_balance(env: Env, circle_id: u64) -> i128 {
-        let circle: CircleInfo = env.storage().instance()
+        let circle: CircleInfo = env.storage::instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
         
@@ -349,7 +349,7 @@ impl SoroSusuTrait for SoroSusu {
         caller.require_auth();
 
         // Get the circle
-        let mut circle: CircleInfo = env.storage().instance()
+        let mut circle: CircleInfo = env.storage::instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
@@ -390,7 +390,7 @@ impl SoroSusuTrait for SoroSusu {
         Self::reset_contributions(&env, circle_id);
 
         // Store updated circle
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage::instance().set(&DataKey::Circle(circle_id), &circle);
 
         // Emit events
         env.events().publish(
@@ -408,7 +408,7 @@ impl SoroSusuTrait for SoroSusu {
 
     fn trigger_payout(env: Env, admin: Address, circle_id: u64) {
         // Admin-only function
-        let stored_admin: Address = env.storage().instance()
+        let stored_admin: Address = env.storage::instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("Admin not set"));
         
@@ -422,7 +422,7 @@ impl SoroSusuTrait for SoroSusu {
 
     fn finalize_round(env: Env, creator: Address, circle_id: u64) {
         // Check authorization (only creator can finalize)
-        let circle: CircleInfo = env.storage().instance()
+        let circle: CircleInfo = env.storage::instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"));
 
@@ -437,7 +437,7 @@ impl SoroSusuTrait for SoroSusu {
 
         // Determine next recipient (simple round-robin for now)
         let next_recipient_index = circle.current_round % (circle.current_members as u32);
-        let next_recipient = env.storage().instance()
+        let next_recipient = env.storage::instance()
             .get(&DataKey::MemberByIndex(circle_id, next_recipient_index))
             .unwrap_or_else(|| panic!("Member not found for next round"));
 
@@ -448,11 +448,11 @@ impl SoroSusuTrait for SoroSusu {
         updated_circle.round_start_time = env.ledger().timestamp();
 
         // Store updated circle
-        env.storage().instance().set(&DataKey::Circle(circle_id), &updated_circle);
+        env.storage::instance().set(&DataKey::Circle(circle_id), &updated_circle);
 
         // Schedule payout time
         let scheduled_time = env.ledger().timestamp() + updated_circle.cycle_duration;
-        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &scheduled_time);
+        env.storage::instance().set(&DataKey::ScheduledPayoutTime(circle_id), &scheduled_time);
 
         // Emit event
         env.events().publish(
@@ -464,7 +464,7 @@ impl SoroSusuTrait for SoroSusu {
     // --- HELPER FUNCTIONS ---
 
     fn get_circle(env: Env, circle_id: u64) -> CircleInfo {
-        env.storage().instance()
+        env.storage::instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap_or_else(|| panic!("Circle not found"))
     }
