@@ -234,7 +234,6 @@ pub enum DataKey {
     SafetyDeposit(Address, u64),
     GroupReserve,
 
-}
 
 /// Individual tranche information
 #[contracttype]
@@ -665,6 +664,7 @@ pub struct DissolvedCircle {
 }
 
 
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -4706,10 +4706,4 @@ fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut
     delegation.last_compound_time = current_time;
 }
 
-fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elapsed: u64) -> i128 {
-    // Simplified yield calculation - in real implementation would query actual pool
-    let apy_bps = 500; // 5% APY
-    let seconds_in_year = 365 * 24 * 60 * 60;
-    let time_fraction = time_elapsed as i128 * 10000 / seconds_in_year as i128;
-    (delegation.delegation_amount * apy_bps as i128 * time_fraction) / (10000 * 10000)
-}
+
