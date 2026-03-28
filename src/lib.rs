@@ -37,6 +37,11 @@ pub enum DataKey {
     UserSbt(Address), // user -> SBT info
     ReputationMilestone(u32), // milestone_id -> milestone config
     SbtRevocationList(Address), // user -> revocation info
+    // Stellar Anchor Interface Keys
+    AnchorRegistry, // registered anchors
+    AnchorInfo(Address), // anchor_address -> anchor info
+    AnchorConfig(Address), // anchor_address -> deposit config
+    PendingDeposit(u64), // deposit_id -> deposit info
 }
 
 #[contracttype]
@@ -80,6 +85,67 @@ pub struct CircleInfo {
     verified_vendor: Option<Address>, // Verified vendor for goal verification
     goal_amount: Option<u64>, // Amount needed for business goal
     pub is_goal_verified: bool, // Whether goal has been verified
+}
+
+// --- STELLAR ANCHOR INTERFACE STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum AnchorStatus {
+    Active,
+    Suspended,
+    Revoked,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AnchorInfo {
+    pub address: Address,
+    pub name: Symbol,
+    pub sep_version: Symbol, // "SEP-24" or "SEP-31"
+    pub status: AnchorStatus,
+    pub registration_timestamp: u64,
+    pub kyc_required: bool,
+    pub supported_tokens: Vec<Address>,
+    pub max_deposit_amount: u64,
+    pub daily_deposit_limit: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AnchorDepositConfig {
+    pub anchor_address: Address,
+    pub circle_id: u64,
+    pub auto_deposit_enabled: bool,
+    pub gas_subsidy_amount: u64,
+    pub fee_bps: u32,
+    pub last_deposit_timestamp: u64,
+    pub total_deposits_made: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum DepositStatus {
+    Pending,
+    Completed,
+    Failed,
+    Refunded,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AnchorDeposit {
+    pub deposit_id: u64,
+    pub anchor_address: Address,
+    pub beneficiary: Address,
+    pub circle_id: u64,
+    pub amount: u64,
+    pub token_address: Address,
+    pub fiat_reference: Symbol, // External transaction reference
+    pub status: DepositStatus,
+    pub timestamp: u64,
+    pub gas_used: u64,
+    pub error_message: Option<Symbol>,
 }
 
 // --- SOULBOUND TOKEN (SBT) STRUCTURES ---
@@ -240,6 +306,25 @@ pub trait SoroSusuTrait {
     fn resume_round(env: Env, caller: Address, circle_id: u64);
     fn get_clawback_deficit(env: Env, circle_id: u64) -> ClawbackDeficit;
     fn get_recovery_plan(env: Env, circle_id: u64) -> RecoveryPlan;
+    fn get_paused_round_info(env: Env, circle_id: u64) -> PausedRound;
+    
+    // Stellar Anchor Interface Functions (SEP-24/SEP-31)
+    fn register_anchor(env: Env, admin: Address, anchor_address: Address, name: Symbol, sep_version: Symbol, kyc_required: bool, supported_tokens: Vec<Address>, max_deposit_amount: u64, daily_deposit_limit: u64);
+    fn deposit_for_user(env: Env, anchor: Address, beneficiary: Address, circle_id: u64, amount: u64, token_address: Address, fiat_reference: Symbol);
+    fn configure_anchor_deposit(env: Env, anchor: Address, circle_id: u64, auto_deposit_enabled: bool, gas_subsidy_amount: u64, fee_bps: u32);
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo;
+    fn get_deposit_status(env: Env, deposit_id: u64) -> AnchorDeposit;
+    fn get_registered_anchors(env: Env) -> Vec<Address>;
+    
+    // SBT Credential Functions
+    fn initialize_sbt_system(env: Env, admin: Address, sbt_contract: Address);
+    fn create_reputation_milestone(env: Env, admin: Address, milestone_id: u32, name: Symbol, description: Symbol, required_cycles: u32, min_reputation_score: u32);
+    fn issue_sbt_credential(env: Env, admin: Address, user: Address, milestone_id: u32);
+    fn revoke_sbt_credential(env: Env, admin: Address, user: Address, reason: Symbol);
+    fn update_sbt_status(env: Env, admin: Address, user: Address, status: SbtStatus);
+    fn get_user_sbt(env: Env, user: Address) -> Option<SoulboundToken>;
+    fn get_reputation_milestone(env: Env, milestone_id: u32) -> ReputationMilestone;
+    fn verify_user_reputation(env: Env, user: Address) -> (u32, bool); // (score, has_sbt)
     fn get_paused_round_info(env: Env, circle_id: u64) -> PausedRound;
     
     // Soulbound Token (SBT) Functions (Issue #210)
@@ -1443,6 +1528,437 @@ impl SoroSusuTrait for SoroSusu {
 
         (circle.business_goal_hash, circle.verified_vendor, circle.goal_amount, circle.is_goal_verified)
     }
+
+    // --- STELLAR ANCHOR INTERFACE IMPLEMENTATION ---
+
+    fn register_anchor(env: Env, admin: Address, anchor_address: Address, name: Symbol, sep_version: Symbol, kyc_required: bool, supported_tokens: Vec<Address>, max_deposit_amount: u64, daily_deposit_limit: u64) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let contract_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != contract_admin {
+            panic!("Unauthorized: Only admin can register anchors");
+        }
+
+        // Create anchor info
+        let anchor_info = AnchorInfo {
+            address: anchor_address.clone(),
+            name,
+            sep_version,
+            status: AnchorStatus::Active,
+            registration_timestamp: env.ledger().timestamp(),
+            kyc_required,
+            supported_tokens,
+            max_deposit_amount,
+            daily_deposit_limit,
+        };
+
+        // Store in registry
+        let mut registry: Vec<Address> = env.storage().instance().get(&DataKey::AnchorRegistry).unwrap_or(Vec::new(&env));
+        if !registry.contains(&anchor_address) {
+            registry.push_back(anchor_address.clone());
+            env.storage().instance().set(&DataKey::AnchorRegistry, &registry);
+        }
+
+        // Store anchor info
+        let anchor_info_key = DataKey::AnchorInfo(anchor_address);
+        env.storage().instance().set(&anchor_info_key, &anchor_info);
+
+        // Emit registration event
+        env.events().publish(
+            (Symbol::short("anchor_registered"), anchor_address, admin),
+            sep_version,
+        );
+    }
+
+    fn deposit_for_user(env: Env, anchor: Address, beneficiary: Address, circle_id: u64, amount: u64, token_address: Address, fiat_reference: Symbol) {
+        anchor.require_auth();
+
+        // Verify anchor is registered and active
+        let anchor_info_key = DataKey::AnchorInfo(anchor.clone());
+        let anchor_info: AnchorInfo = env.storage().instance().get(&anchor_info_key)
+            .unwrap_or_else(|| panic!("Anchor not registered"));
+
+        if anchor_info.status != AnchorStatus::Active {
+            panic!("Anchor is not active");
+        }
+
+        // Verify token is supported
+        if !anchor_info.supported_tokens.contains(&token_address) {
+            panic!("Token not supported by anchor");
+        }
+
+        // Check deposit limits
+        if amount > anchor_info.max_deposit_amount {
+            panic!("Deposit amount exceeds maximum limit");
+        }
+
+        // Get circle info
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        if circle.is_paused {
+            panic!("Circle is paused due to clawback detection");
+        }
+
+        // Verify beneficiary is a member of the circle
+        let member_key = DataKey::Member(beneficiary.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("Beneficiary is not a member of this circle"));
+
+        if !member.is_active {
+            panic!("Beneficiary member is not active");
+        }
+
+        // Generate unique deposit ID
+        let deposit_id = env.ledger().timestamp() + (circle_id << 32);
+
+        // Create deposit record
+        let deposit = AnchorDeposit {
+            deposit_id,
+            anchor_address: anchor.clone(),
+            beneficiary: beneficiary.clone(),
+            circle_id,
+            amount,
+            token_address: token_address.clone(),
+            fiat_reference,
+            status: DepositStatus::Pending,
+            timestamp: env.ledger().timestamp(),
+            gas_used: 0,
+            error_message: None,
+        };
+
+        // Store deposit
+        env.storage().instance().set(&DataKey::PendingDeposit(deposit_id), &deposit);
+
+        // Process the deposit (similar to regular deposit but with anchor as relayer)
+        let token_client = token::Client::new(&env, &token_address);
+
+        // Calculate insurance fee
+        let insurance_fee = ((amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
+        let total_amount = amount + insurance_fee;
+
+        // Update expected balance before transfer
+        circle.expected_balance += total_amount;
+
+        // Transfer from anchor to contract
+        token_client.transfer(&anchor, &env.current_contract_address(), &total_amount);
+
+        if insurance_fee > 0 {
+            circle.insurance_balance += insurance_fee;
+        }
+
+        // Update member contribution
+        member.contribution_count += 1;
+        member.last_contribution_time = env.ledger().timestamp();
+        env.storage().instance().set(&member_key, &member);
+
+        // Update circle
+        circle.deadline_timestamp = env.ledger().timestamp() + circle.cycle_duration;
+        circle.contribution_bitmap |= 1 << member.index;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Update deposit status to completed
+        let mut completed_deposit = deposit;
+        completed_deposit.status = DepositStatus::Completed;
+        env.storage().instance().set(&DataKey::PendingDeposit(deposit_id), &completed_deposit);
+
+        // Mine governance tokens if enabled
+        Self::mine_governance_tokens(env.clone(), beneficiary.clone(), circle_id, &mut circle, &mut Member { ..member });
+
+        // Check cycle completion
+        Self::check_and_complete_cycle(env.clone(), circle_id);
+
+        // Check for SBT credential
+        Self::check_and_issue_sbt_credential(env.clone(), beneficiary.clone());
+
+        // Emit events
+        env.events().publish(
+            (Symbol::short("anchor_deposit_completed"), anchor, beneficiary),
+            (deposit_id, amount),
+        );
+    }
+
+    fn configure_anchor_deposit(env: Env, anchor: Address, circle_id: u64, auto_deposit_enabled: bool, gas_subsidy_amount: u64, fee_bps: u32) {
+        anchor.require_auth();
+
+        // Verify anchor is registered
+        let anchor_info_key = DataKey::AnchorInfo(anchor.clone());
+        let _anchor_info: AnchorInfo = env.storage().instance().get(&anchor_info_key)
+            .unwrap_or_else(|| panic!("Anchor not registered"));
+
+        // Create or update deposit config
+        let config = AnchorDepositConfig {
+            anchor_address: anchor.clone(),
+            circle_id,
+            auto_deposit_enabled,
+            gas_subsidy_amount,
+            fee_bps,
+            last_deposit_timestamp: 0,
+            total_deposits_made: 0,
+        };
+
+        // Store config
+        let anchor_config_key = DataKey::AnchorConfig(anchor.clone());
+        env.storage().instance().set(&anchor_config_key, &config);
+
+        // Emit configuration event
+        env.events().publish(
+            (Symbol::short("anchor_config_updated"), anchor, circle_id),
+            auto_deposit_enabled,
+        );
+    }
+
+    fn get_anchor_info(env: Env, anchor_address: Address) -> AnchorInfo {
+        let anchor_info_key = DataKey::AnchorInfo(anchor_address);
+        env.storage().instance().get(&anchor_info_key)
+            .unwrap_or_else(|| panic!("Anchor not found"))
+    }
+
+    fn get_deposit_status(env: Env, deposit_id: u64) -> AnchorDeposit {
+        env.storage().instance().get(&DataKey::PendingDeposit(deposit_id))
+            .unwrap_or_else(|| panic!("Deposit not found"))
+    }
+
+    fn get_registered_anchors(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::AnchorRegistry).unwrap_or(Vec::new(&env))
+    }
+
+    // --- SBT CREDENTIAL IMPLEMENTATION ---
+
+    fn initialize_sbt_system(env: Env, admin: Address, sbt_contract: Address) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let contract_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != contract_admin {
+            panic!("Unauthorized: Only admin can initialize SBT system");
+        }
+
+        // Set SBT contract address
+        env.storage().instance().set(&DataKey::SbtContract, &sbt_contract);
+
+        // Create default reputation milestone (5 cycles, 80 reputation)
+        let milestone = ReputationMilestone {
+            id: 1,
+            name: Symbol::short("Reliable_Saver"),
+            description: Symbol::short("Completed_5_cycles_with_80+ reputation"),
+            required_cycles: 5,
+            min_reputation_score: 80,
+            is_active: true,
+        };
+
+        env.storage().instance().set(&DataKey::ReputationMilestone(1), &milestone);
+
+        // Emit initialization event
+        env.events().publish(
+            (Symbol::short("sbt_system_initialized"), admin, sbt_contract),
+            true,
+        );
+    }
+
+    fn create_reputation_milestone(env: Env, admin: Address, milestone_id: u32, name: Symbol, description: Symbol, required_cycles: u32, min_reputation_score: u32) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let contract_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != contract_admin {
+            panic!("Unauthorized: Only admin can create milestones");
+        }
+
+        // Create milestone
+        let milestone = ReputationMilestone {
+            id: milestone_id,
+            name,
+            description,
+            required_cycles,
+            min_reputation_score,
+            is_active: true,
+        };
+
+        // Store milestone
+        env.storage().instance().set(&DataKey::ReputationMilestone(milestone_id), &milestone);
+
+        // Emit milestone creation event
+        env.events().publish(
+            (Symbol::short("milestone_created"), admin, milestone_id),
+            required_cycles,
+        );
+    }
+
+    fn issue_sbt_credential(env: Env, admin: Address, user: Address, milestone_id: u32) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let contract_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != contract_admin {
+            panic!("Unauthorized: Only admin can issue SBT credentials");
+        }
+
+        // Check if SBT system is initialized
+        let sbt_contract: Address = env.storage().instance().get(&DataKey::SbtContract)
+            .unwrap_or_else(|| panic!("SBT system not initialized"));
+
+        // Check if user already has SBT
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        if env.storage().instance().has(&user_sbt_key) {
+            panic!("User already has an SBT credential");
+        }
+
+        // Get milestone
+        let milestone: ReputationMilestone = env.storage().instance().get(&DataKey::ReputationMilestone(milestone_id))
+            .unwrap_or_else(|| panic!("Milestone not found"));
+
+        if !milestone.is_active {
+            panic!("Milestone is not active");
+        }
+
+        // Calculate user's reputation and cycles
+        let reputation_score = Self::calculate_user_reputation_score(env.clone(), user.clone());
+        let total_cycles = Self::get_user_total_cycles_completed(env.clone(), user.clone());
+
+        // Verify user meets requirements
+        if total_cycles < milestone.required_cycles || reputation_score < milestone.min_reputation_score {
+            panic!("User does not meet milestone requirements");
+        }
+
+        // Create SBT
+        let token_id = (milestone_id as u128) << 96 | (env.ledger().timestamp() as u128);
+        
+        let sbt = SoulboundToken {
+            token_id,
+            owner: user.clone(),
+            milestone_id,
+            issued_at: env.ledger().timestamp(),
+            status: SbtStatus::Active,
+            reputation_score,
+            cycles_completed: total_cycles,
+            metadata: milestone.name,
+        };
+
+        // Store SBT
+        env.storage().instance().set(&user_sbt_key, &sbt);
+
+        // Mint SBT on external contract
+        let sbt_client = SbtTokenClient::new(&env, &sbt_contract);
+        sbt_client.mint_sbt(&user, &token_id, &milestone.name);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::short("sbt_issued"), user, milestone_id),
+            token_id,
+        );
+    }
+
+    fn revoke_sbt_credential(env: Env, admin: Address, user: Address, reason: Symbol) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let contract_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != contract_admin {
+            panic!("Unauthorized: Only admin can revoke SBT credentials");
+        }
+
+        // Get user's SBT
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        let mut sbt: SoulboundToken = env.storage().instance().get(&user_sbt_key)
+            .unwrap_or_else(|| panic!("User does not have an SBT credential"));
+
+        if sbt.status == SbtStatus::Revoked {
+            panic!("SBT is already revoked");
+        }
+
+        // Update status
+        sbt.status = SbtStatus::Revoked;
+        env.storage().instance().set(&user_sbt_key, &sbt);
+
+        // Get SBT contract
+        let sbt_contract: Address = env.storage().instance().get(&DataKey::SbtContract)
+            .unwrap_or_else(|| panic!("SBT system not initialized"));
+
+        // Update metadata on external contract
+        let sbt_client = SbtTokenClient::new(&env, &sbt_contract);
+        sbt_client.update_metadata(&sbt.token_id, &Symbol::short("Revoked"));
+
+        // Store revocation info
+        let revocation_info = SbtRevocationInfo {
+            user: user.clone(),
+            token_id: sbt.token_id,
+            revoked_at: env.ledger().timestamp(),
+            reason,
+            revoked_by: admin.clone(),
+        };
+
+        env.storage().instance().set(&DataKey::SbtRevocationList(user.clone()), &revocation_info);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::short("sbt_revoked"), user, admin),
+            (sbt.token_id, reason),
+        );
+    }
+
+    fn update_sbt_status(env: Env, admin: Address, user: Address, status: SbtStatus) {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let contract_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != contract_admin {
+            panic!("Unauthorized: Only admin can update SBT status");
+        }
+
+        // Get user's SBT
+        let user_sbt_key = DataKey::UserSbt(user.clone());
+        let mut sbt: SoulboundToken = env.storage().instance().get(&user_sbt_key)
+            .unwrap_or_else(|| panic!("User does not have an SBT credential"));
+
+        // Update status
+        sbt.status = status;
+        env.storage().instance().set(&user_sbt_key, &sbt);
+
+        // Get SBT contract
+        let sbt_contract: Address = env.storage().instance().get(&DataKey::SbtContract)
+            .unwrap_or_else(|| panic!("SBT system not initialized"));
+
+        // Update metadata on external contract
+        let status_symbol = match status {
+            SbtStatus::Active => Symbol::short("Active"),
+            SbtStatus::Dishonored => Symbol::short("Dishonored"),
+            SbtStatus::Revoked => Symbol::short("Revoked"),
+        };
+
+        let sbt_client = SbtTokenClient::new(&env, &sbt_contract);
+        sbt_client.update_metadata(&sbt.token_id, &status_symbol);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::short("sbt_status_updated"), user, admin),
+            (sbt.token_id, status_symbol),
+        );
+    }
+
+    fn get_user_sbt(env: Env, user: Address) -> Option<SoulboundToken> {
+        let user_sbt_key = DataKey::UserSbt(user);
+        env.storage().instance().get(&user_sbt_key)
+    }
+
+    fn get_reputation_milestone(env: Env, milestone_id: u32) -> ReputationMilestone {
+        env.storage().instance().get(&DataKey::ReputationMilestone(milestone_id))
+            .unwrap_or_else(|| ReputationMilestone {
+                id: milestone_id,
+                name: Symbol::short("Unknown"),
+                description: Symbol::short("Milestone not found"),
+                required_cycles: 0,
+                min_reputation_score: 0,
+                is_active: false,
+            })
+    }
+
+    fn verify_user_reputation(env: Env, user: Address) -> (u32, bool) {
+        let reputation_score = Self::calculate_user_reputation_score(env.clone(), user.clone());
+        let has_sbt = env.storage().instance().has(&DataKey::UserSbt(user.clone()));
+        (reputation_score, has_sbt)
+    }
 }
 
 // --- PRIVATE HELPER FUNCTIONS ---
@@ -1751,3 +2267,6 @@ mod clawback_tests;
 
 #[cfg(test)]
 mod commission_tests;
+
+#[cfg(test)]
+mod anchor_tests;
