@@ -219,6 +219,14 @@ const TRANCHE_LOCKED_PERCENTAGE_BPS: u32 = 3000; // 30% locked in tranches
 const TRANCHE_COUNT: u32 = 2; // Number of tranches for locked amount (2 rounds)
 const TRANCHE_CLAIM_GRACE_PERIOD: u64 = 2592000; // 30 days grace period to claim unlocked tranches
 
+// Temporal Flexibility Constants (Dynamic Round Duration)
+const DURATION_CHANGE_VOTING_PERIOD: u64 = 172800; // 48 hours for duration change voting
+const DURATION_CHANGE_QUORUM: u32 = 50; // 50% quorum for duration change
+const DURATION_CHANGE_MAJORITY: u32 = 66; // 66% supermajority required
+const MIN_CYCLE_DURATION: u64 = 604800; // Minimum 7 days (1 week)
+const MAX_CYCLE_DURATION: u64 = 7776000; // Maximum 90 days
+const DURATION_CHANGE_COOLDOWN: u64 = 604800; // 7 days cooldown between duration changes
+
 // --- DATA STRUCTURES ---
 
 #[contracttype]
@@ -233,7 +241,55 @@ pub enum DataKey {
     LastCreatedTimestamp(Address),
     SafetyDeposit(Address, u64),
     GroupReserve,
+    DurationChangeProposal(u64),       // circle_id -> DurationChangeProposal
+    DurationChangeVote(u64, Address),   // (circle_id, voter) -> DurationChangeVote
+    LastDurationChangeTime(u64),        // circle_id -> timestamp of last applied duration change
+}
 
+/// Temporal Flexibility: vote choice for duration changes
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DurationChangeVoteChoice {
+    SpeedUp,  // Vote to approve the proposed duration change
+    SlowDown, // Vote to reject the proposed duration change (keep current)
+}
+
+/// Temporal Flexibility: status of a duration change proposal
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DurationChangeStatus {
+    Voting,
+    Approved,
+    Rejected,
+    Applied,
+    Expired,
+}
+
+/// Temporal Flexibility: a proposal to change the round duration
+#[contracttype]
+#[derive(Clone)]
+pub struct DurationChangeProposal {
+    pub circle_id: u64,
+    pub proposer: Address,
+    pub current_duration: u64,
+    pub proposed_duration: u64,
+    pub created_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: DurationChangeStatus,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+}
+
+/// Temporal Flexibility: individual vote record
+#[contracttype]
+#[derive(Clone)]
+pub struct DurationChangeVoteRecord {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: DurationChangeVoteChoice,
+    pub timestamp: u64,
+}
 
 /// Individual tranche information
 #[contracttype]
@@ -870,6 +926,9 @@ pub trait SoroSusuTrait {
 
     fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32);
     fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64);
+    fn vote_duration_change(env: Env, user: Address, circle_id: u64, vote_choice: DurationChangeVoteChoice);
+    fn apply_duration_change(env: Env, circle_id: u64);
+    fn get_duration_change_proposal(env: Env, circle_id: u64) -> Option<DurationChangeProposal>;
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
 
     fn propose_address_change(
@@ -2769,8 +2828,176 @@ impl SoroSusuTrait for SoroSusu {
 
     fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64) {
         user.require_auth();
-        if new_duration == 0 {
-            panic!("Duration must be greater than zero");
+
+        // Validate duration bounds
+        if new_duration < MIN_CYCLE_DURATION {
+            panic!("Duration must be at least 7 days");
+        }
+        if new_duration > MAX_CYCLE_DURATION {
+            panic!("Duration cannot exceed 90 days");
+        }
+
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // Must be an active member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
+            .expect("User is not a member");
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // No-op guard: proposed duration must differ from current
+        if new_duration == circle.cycle_duration {
+            panic!("Proposed duration is the same as current");
+        }
+
+        // Check cooldown since last applied duration change
+        let cooldown_key = DataKey::LastDurationChangeTime(circle_id);
+        let current_time = env.ledger().timestamp();
+        if let Some(last_change) = env.storage().instance().get::<DataKey, u64>(&cooldown_key) {
+            if current_time < last_change + DURATION_CHANGE_COOLDOWN {
+                panic!("Duration change cooldown not elapsed");
+            }
+        }
+
+        // Check no active proposal already exists
+        let proposal_key = DataKey::DurationChangeProposal(circle_id);
+        if let Some(existing) = env.storage().instance().get::<DataKey, DurationChangeProposal>(&proposal_key) {
+            if existing.status == DurationChangeStatus::Voting {
+                panic!("Duration change proposal already active");
+            }
+        }
+
+        let proposal = DurationChangeProposal {
+            circle_id,
+            proposer: user.clone(),
+            current_duration: circle.cycle_duration,
+            proposed_duration: new_duration,
+            created_timestamp: current_time,
+            voting_deadline: current_time + DURATION_CHANGE_VOTING_PERIOD,
+            status: DurationChangeStatus::Voting,
+            for_votes: 1,         // Proposer auto-votes for
+            against_votes: 0,
+            total_votes_cast: 1,
+        };
+
+        env.storage().instance().set(&proposal_key, &proposal);
+
+        // Record proposer's vote
+        let vote_key = DataKey::DurationChangeVote(circle_id, user.clone());
+        let vote_record = DurationChangeVoteRecord {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: DurationChangeVoteChoice::SpeedUp,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote_record);
+
+        write_audit(&env, &user, AuditAction::DisputeSubmission, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "DURATION_CHANGE_PROPOSED"), circle_id, user.clone()),
+            (circle.cycle_duration, new_duration, proposal.voting_deadline),
+        );
+    }
+
+    fn vote_duration_change(env: Env, user: Address, circle_id: u64, vote_choice: DurationChangeVoteChoice) {
+        user.require_auth();
+
+        let proposal_key = DataKey::DurationChangeProposal(circle_id);
+        let mut proposal: DurationChangeProposal = env
+            .storage()
+            .instance()
+            .get(&proposal_key)
+            .expect("No active duration change proposal");
+
+        if proposal.status != DurationChangeStatus::Voting {
+            panic!("Duration change proposal is not in voting period");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time > proposal.voting_deadline {
+            proposal.status = DurationChangeStatus::Expired;
+            env.storage().instance().set(&proposal_key, &proposal);
+            panic!("Voting period has expired");
+        }
+
+        // Verify active membership
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
+            .expect("User is not a member");
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Prevent double voting
+        let vote_key = DataKey::DurationChangeVote(circle_id, user.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted on this duration change");
+        }
+
+        // Record vote
+        let vote_record = DurationChangeVoteRecord {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: vote_choice.clone(),
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote_record);
+
+        match vote_choice {
+            DurationChangeVoteChoice::SpeedUp => proposal.for_votes += 1,
+            DurationChangeVoteChoice::SlowDown => proposal.against_votes += 1,
+        }
+        proposal.total_votes_cast += 1;
+
+        // Check voting criteria: 50% quorum, 66% supermajority
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let active_members = count_active_members(&env, &circle);
+
+        let quorum_met = (proposal.total_votes_cast * 100) >= (active_members * DURATION_CHANGE_QUORUM);
+
+        if quorum_met && proposal.total_votes_cast > 0 {
+            let approval_pct = (proposal.for_votes * 100) / proposal.total_votes_cast;
+            if approval_pct >= DURATION_CHANGE_MAJORITY {
+                proposal.status = DurationChangeStatus::Approved;
+            }
+        }
+
+        env.storage().instance().set(&proposal_key, &proposal);
+        write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "DURATION_VOTE_CAST"), circle_id, user.clone()),
+            (vote_choice, proposal.for_votes, proposal.against_votes),
+        );
+    }
+
+    fn apply_duration_change(env: Env, circle_id: u64) {
+        let proposal_key = DataKey::DurationChangeProposal(circle_id);
+        let mut proposal: DurationChangeProposal = env
+            .storage()
+            .instance()
+            .get(&proposal_key)
+            .expect("No duration change proposal found");
+
+        if proposal.status != DurationChangeStatus::Approved {
+            panic!("Duration change proposal is not approved");
         }
 
         let mut circle: CircleInfo = env
@@ -2778,20 +3005,57 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .get(&DataKey::Circle(circle_id))
             .expect("Circle not found");
-        let protocol_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Not initialized");
 
-        if user != circle.creator && user != protocol_admin {
-            panic!("Unauthorized");
+        let current_time = env.ledger().timestamp();
+        let old_duration = circle.cycle_duration;
+
+        // Apply the new duration
+        circle.cycle_duration = proposal.proposed_duration;
+
+        // Recalculate deadline_timestamp on the fly:
+        // If we are mid-round, compute how far along we are and scale the remaining time.
+        if circle.deadline_timestamp > current_time {
+            let old_deadline = circle.deadline_timestamp;
+            let elapsed = old_deadline.saturating_sub(old_duration).max(current_time.saturating_sub(old_duration));
+            let time_into_round = current_time.saturating_sub(old_deadline.saturating_sub(old_duration));
+            // Scale proportionally: remaining = proposed_duration - (time_into_round * proposed_duration / old_duration)
+            let scaled_remaining = if old_duration > 0 {
+                proposal.proposed_duration.saturating_sub(
+                    (time_into_round * proposal.proposed_duration) / old_duration
+                )
+            } else {
+                proposal.proposed_duration
+            };
+            circle.deadline_timestamp = current_time + scaled_remaining;
+        } else {
+            // Round already elapsed, set deadline from now
+            circle.deadline_timestamp = current_time + proposal.proposed_duration;
         }
 
-        circle.cycle_duration = new_duration;
-        circle.deadline_timestamp = env.ledger().timestamp() + new_duration;
+        // Recalculate the scheduled payout time
+        let new_payout_time = circle.deadline_timestamp;
+        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &new_payout_time);
+
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-        write_audit(&env, &user, AuditAction::AdminAction, circle_id);
+
+        // Mark proposal as applied
+        proposal.status = DurationChangeStatus::Applied;
+        env.storage().instance().set(&proposal_key, &proposal);
+
+        // Set cooldown timestamp
+        env.storage().instance().set(&DataKey::LastDurationChangeTime(circle_id), &current_time);
+
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "DURATION_CHANGED"), circle_id),
+            (old_duration, proposal.proposed_duration, circle.deadline_timestamp),
+        );
+    }
+
+    fn get_duration_change_proposal(env: Env, circle_id: u64) -> Option<DurationChangeProposal> {
+        let proposal_key = DataKey::DurationChangeProposal(circle_id);
+        env.storage().instance().get(&proposal_key)
     }
 
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64) {
