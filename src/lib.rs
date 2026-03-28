@@ -1,223 +1,15 @@
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, token, panic, Map, Vec, i128, u64, u32};
+#![no_std]
+use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Symbol, token, panic, Map, Vec};
 
 mod liquidity_buffer;
-
-pub use liquidity_buffer::*;
+mod lending_market;
 mod sbt_minter;
 
+pub use liquidity_buffer::*;
 pub use lending_market::*;
 mod tranche_system;
 
 pub use tranche_system::*;
-
-// --- DATA STRUCTURES ---
-
-#[derive(Clone)]
-pub struct CircleInfo {
-    pub creator: Address,
-    pub contribution_amount: u64,
-    pub max_members: u16,
-    pub current_members: u16,
-    pub token: Address,
-    pub cycle_duration: u64,
-    pub insurance_fee_bps: u32, // basis points (100 = 1%)
-    pub organizer_fee_bps: u32,  // basis points (100 = 1%)
-    pub nft_contract: Address,
-    pub arbitrator: Address,
-    pub members: Vec<Address>,
-    pub contributions: Map<Address, bool>,
-    pub current_round: u32,
-    pub round_start_time: u64,
-    pub is_round_finalized: bool,
-    pub current_pot_recipient: Option<Address>,
-    pub gas_buffer_balance: i128, // XLM buffer for gas fees
-    pub gas_buffer_enabled: bool,
-}
-
-#[derive(Clone)]
-pub struct Member {
-    pub address: Address,
-    pub join_time: u64,
-    pub total_contributions: i128,
-    pub total_received: i128,
-    pub has_contributed_current_round: bool,
-    pub consecutive_missed_rounds: u32,
-}
-
-#[derive(Clone)]
-pub struct GasBufferConfig {
-    pub min_buffer_amount: i128,     // Minimum XLM to maintain as buffer
-    pub max_buffer_amount: i128,     // Maximum XLM that can be buffered
-    pub auto_refill_threshold: i128, // When to auto-refill the buffer
-    pub emergency_buffer: i128,      // Emergency buffer for extreme network conditions
-}
-
-// --- STORAGE KEYS ---
-
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    CircleCount,
-    Circle(u64),
-    Member(Address),
-    MemberByIndex(u64, u32), // For efficient recipient lookup
-    GasBufferConfig(u64),  // Per-circle gas buffer config
-    ProtocolConfig,
-    ScheduledPayoutTime(u64),
-    // SBT Credential System Storage
-    SoroSusuCredential(u128),    // Token ID -> Credential mapping
-    UserCredential(Address),        // User -> Their SBT
-    ReputationMilestone(u64),      // Milestone ID -> Milestone data
-    MilestoneCounter,              // Counter for generating milestone IDs
-    UserReputationScore(Address),    // User -> Reputation metrics
-    SbtMinterAdmin,              // Admin address for SBT operations
-    // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
-    AnchorRegistry, // Registry of authorized anchors
-    AnchorDeposit(u64), // Track anchor deposits per circle
-    DepositMemo(u64), // Track deposit memos for compliance
-}
-
-// --- CONTRACT TRAIT ---
-
-pub trait SoroSusuTrait {
-    // Initialize the contract
-    fn init(env: Env, admin: Address);
-    
-    // Create a new savings circle
-    fn create_circle(
-        env: Env,
-        creator: Address,
-        contribution_amount: u64,
-        max_members: u16,
-        token: Address,
-        cycle_duration: u64,
-        insurance_fee_bps: u32,
-        nft_contract: Address,
-        arbitrator: Address,
-        organizer_fee_bps: u32,
-    ) -> u64;
-
-    // Join an existing circle
-    fn join_circle(env: Env, user: Address, circle_id: u64);
-
-    // Make a deposit (Pay your weekly/monthly due)
-    fn deposit(env: Env, user: Address, circle_id: u64);
-
-    // NEW: Gas buffer management functions
-    fn fund_gas_buffer(env: Env, circle_id: u64, amount: i128);
-    fn set_gas_buffer_config(env: Env, circle_id: u64, config: GasBufferConfig);
-    fn get_gas_buffer_balance(env: Env, circle_id: u64) -> i128;
-
-    // NEW: Payout functions with gas buffer support
-    fn distribute_payout(env: Env, caller: Address, circle_id: u64);
-    fn trigger_payout(env: Env, admin: Address, circle_id: u64);
-    fn finalize_round(env: Env, creator: Address, circle_id: u64);
-
-    // Helper functions
-    // ... (rest of the code remains the same)
-    Unauthorized = 1,
-    MemberNotFound = 2,
-    CircleFull = 3,
-    AlreadyMember = 4,
-    CircleNotFound = 5,
-    InvalidAmount = 6,
-    RoundAlreadyFinalized = 7,
-    RoundNotFinalized = 8,
-    NotAllContributed = 9,
-    PayoutNotScheduled = 10,
-    PayoutTooEarly = 11,
-    InsufficientInsurance = 12,
-    InsuranceAlreadyUsed = 13,
-    RateLimitExceeded = 14,
-    InvalidBasketWeights = 15,
-    BasketNotEnabled = 16,
-    InvalidBasketRatio = 17,
-    AnchorNotFound = 18,
-    AnchorNotAuthorized = 19,
-    InvalidDepositMemo = 20,
-    DepositAlreadyProcessed = 21,
-    ComplianceCheckFailed = 22,
-    // Tranche-based payout errors
-    TrancheNotFound = 23,
-    TrancheNotUnlocked = 24,
-    TrancheAlreadyClaimed = 25,
-    MemberDefaulted = 26,
-    TrancheClawbackFailed = 27,
-}
-
-// --- CONSTANTS ---
-// Batch payout configuration
-const MIN_WINNERS_PER_ROUND: u16 = 1;
-const MAX_WINNERS_PER_ROUND: u16 = 10;
-const VALID_WINNER_COUNTS: [u16; 4] = [1, 2, 5, 10]; // Allowed winner counts
-const STROOP_PRECISION: i128 = 10_000_000; // 7 decimal places for Stellar
-
-const REFERRAL_DISCOUNT_BPS: u32 = 500; // 5%
-const RATE_LIMIT_SECONDS: u64 = 300; // 5 minutes
-const LENIENCY_GRACE_PERIOD: u64 = 172800; // 48 hours in seconds
-const VOTING_PERIOD: u64 = 86400; // 24 hours voting period
-const MINIMUM_VOTING_PARTICIPATION: u32 = 50; // 50% minimum participation
-const SIMPLE_MAJORITY_THRESHOLD: u32 = 51; // 51% simple majority
-const QUADRATIC_VOTING_PERIOD: u64 = 604800; // 7 days for rule changes
-const QUADRATIC_QUORUM: u32 = 40; // 40% quorum for quadratic voting
-const QUADRATIC_MAJORITY: u32 = 60; // 60% supermajority for rule changes
-const MAX_VOTE_WEIGHT: u32 = 100; // Maximum quadratic vote weight
-const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for groups >= 10 members
-const DISSOLUTION_VOTING_PERIOD: u64 = 1209600; // 14 days for dissolution voting
-const DISSOLUTION_SUPERMAJORITY: u32 = 75; // 75% supermajority for dissolution
-const DISSOLUTION_REFUND_PERIOD: u64 = 2592000; // 30 days for refund claims after dissolution
-const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
-const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
-const MAX_QUERY_LIMIT: u32 = 100;
-const ROLLOVER_VOTING_PERIOD: u64 = 172800; // 48 hours for rollover voting
-const ROLLOVER_QUORUM: u32 = 60; // 60% quorum for rollover voting
-const ROLLOVER_MAJORITY: u32 = 66; // 66% supermajority for rollover approval
-const DEFAULT_ROLLOVER_BONUS_BPS: u32 = 5000; // 50% of platform fee refunded as bonus
-
-// Yield Delegation Constants
-const YIELD_VOTING_PERIOD: u64 = 86400; // 24 hours for yield delegation voting
-const YIELD_QUORUM: u32 = 75; // 75% quorum for yield delegation (higher stakes)
-const YIELD_MAJORITY: u32 = 80; // 80% supermajority for yield delegation approval
-const MIN_DELEGATION_AMOUNT: i128 = 100_000_000; // Minimum 10 tokens to delegate
-const MAX_DELEGATION_PERCENTAGE: u32 = 8000; // Maximum 80% of pot can be delegated
-const YIELD_DISTRIBUTION_RECIPIENT_BPS: u32 = 5000; // 50% to current round winner
-const YIELD_DISTRIBUTION_TREASURY_BPS: u32 = 5000; // 50% to group treasury
-const YIELD_COMPOUNDING_FREQUENCY: u64 = 604800; // Weekly compounding (7 days)
-
-// Path Payment Constants
-const PATH_PAYMENT_VOTING_PERIOD: u64 = 43200; // 12 hours for path payment voting
-const PATH_PAYMENT_QUORUM: u32 = 50; // 50% quorum for path payment approval
-const PATH_PAYMENT_MAJORITY: u32 = 66; // 66% majority for path payment approval
-const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
-const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
-const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
-
-// --- POT LIQUIDITY BUFFER FOR BANK HOLIDAYS ---
-
-const LIQUIDITY_BUFFER_ADVANCE_PERIOD: u64 = 172800; // 48 hours advance window
-const LIQUIDITY_BUFFER_MIN_REPUTATION: u32 = 10000; // 100% reputation required
-const LIQUIDITY_BUFFER_MAX_ADVANCE_BPS: u32 = 10000; // 100% of contribution can be advanced
-const LIQUIDITY_BUFFER_PLATFORM_FEE_ALLOCATION: u32 = 2000; // 20% of platform fees allocated to buffer
-const LIQUIDITY_BUFFER_MIN_RESERVE: i128 = 1_000_000_000; // Minimum 100 tokens in reserve
-const LIQUIDITY_BUFFER_MAX_RESERVE: i128 = 10_000_000_000; // Maximum 10,000 tokens in reserve
-const LIQUIDITY_BUFFER_ADVANCE_FEE_BPS: u32 = 50; // 0.5% fee for advance usage
-const LIQUIDITY_BUFFER_GRACE_PERIOD: u64 = 86400; // 24 hours grace period for repayment
-const LIQUIDITY_BUFFER_MAX_ADVANCES_PER_ROUND: u32 = 3; // Maximum advances per member per round
-
-// Asset Swap / Economic Circuit Breaker Constants
-const PRICE_DROP_THRESHOLD_BPS: u32 = 2000; // 20% price drop triggers circuit breaker
-const ASSET_SWAP_VOTING_PERIOD: u64 = 86400; // 24 hours for asset swap voting
-const ASSET_SWAP_QUORUM: u32 = 60; // 60% quorum for asset swap approval
-const ASSET_SWAP_MAJORITY: u32 = 66; // 66% majority for asset swap approval
-const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
-const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
-const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
-
-// Tranche-Based Payout Constants
-const TRANCHE_IMMEDIATE_PAYOUT_BPS: u32 = 7000; // 70% paid immediately
-const TRANCHE_LOCKED_PERCENTAGE_BPS: u32 = 3000; // 30% locked in tranches
-const TRANCHE_COUNT: u32 = 2; // Number of tranches for locked amount (2 rounds)
-const TRANCHE_CLAIM_GRACE_PERIOD: u64 = 2592000; // 30 days grace period to claim unlocked tranches
 
 // --- DATA STRUCTURES ---
 
@@ -233,7 +25,54 @@ pub enum DataKey {
     LastCreatedTimestamp(Address),
     SafetyDeposit(Address, u64),
     GroupReserve,
-
+    AuditAll,
+    AuditByActor(Address),
+    AuditByResource(u64),
+    AuditCount,
+    AuditEntry(u64),
+    BasketAssetContrib(u64, Address, Address),
+    CircleLoan(u64),
+    CircleRiskLevel(u64),
+    CollateralVault(Address, u64),
+    CycleBadge(Address, u64),
+    DexRegistry(Address),
+    GroupInsuranceFund(u64),
+    GroupLeadBond(u64),
+    GroupTreasury(u64),
+    InsurancePremium(u64, Address),
+    LastDepositLedger(Address),
+    LastWithdrawalLedger(Address),
+    LeaseFlowContract,
+    LeaseFlowPayoutAuthorization(Address, u64),
+    LendingPool,
+    LeniencyStats(u64),
+    LiquidityVault,
+    ManualPrice(u64),
+    OracleHeartbeat,
+    PathPayment(u64),
+    PathPaymentVote(u64, Address),
+    PausedPayout(Address, u64),
+    PaymentOrderCounter(u64, u32),
+    PaymentTiming(u64, u32, Address),
+    Proposal(u64),
+    ProtocolFeeBps,
+    ProtocolTreasury,
+    ReputationMilestone(u64),
+    RolloverBonus(u64),
+    RolloverVote(u64, Address),
+    SbtContract,
+    SlashingProposal(u64),
+    SocialCapital(Address, u64),
+    SupportedTokens(Address),
+    TrancheSchedule(u64, Address),
+    TrustMode,
+    UserSbt(Address),
+    UserStats(Address),
+    Vote(u64, Address),
+    YieldDelegation(u64),
+    YieldPoolRegistry,
+    YieldVote(u64, Address),
+}
 
 /// Individual tranche information
 #[contracttype]
