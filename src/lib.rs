@@ -7,6 +7,7 @@ pub mod receipt;
 pub mod goal_escrow;           // ← NEW: Goal Escrow Module
 
 // --- DATA STRUCTURES ---
+const TAX_WITHHOLDING_BPS: u64 = 1000; // 10%
 
 #[contracttype]
 #[derive(Clone)]
@@ -88,6 +89,20 @@ pub struct CircleInfo {
     pub token: Address,
     pub deadline_timestamp: u64,
     pub cycle_duration: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TaxReport {
+    pub circle_id: u64,
+    pub user: Address,
+    pub gross_interest_total_for_circle: u64,
+    pub gross_interest_for_user: u64,
+    pub total_tax_withheld_for_circle: u64,
+    pub total_tax_withheld_for_user: u64,
+    pub total_tax_claimed_for_circle: u64,
+    pub total_tax_claimed_for_user: u64,
+    pub current_tax_vault_balance: u64,
 }
 
 // --- CONTRACT TRAIT ---
