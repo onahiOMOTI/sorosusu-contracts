@@ -1,5 +1,6 @@
 #![no_std]
 use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
+pub mod receipt;
 
 // --- DATA STRUCTURES ---
 
@@ -397,6 +398,18 @@ impl SoroSusuTrait for SoroSusu {
 
         env.storage().instance().set(&DataKey::GlobalFeeBP, &new_fee);
     }
+
+    fn generate_receipt(
+        env: Env,
+        contributor: Address,
+        group_id: u32,
+        amount: u128,
+        asset_code: String,
+        group_name: String,
+    ) -> String {
+        Self::generate_receipt(env, contributor, group_id, amount, asset_code, group_name)
+    }
+}
 }
 
 // --- FUZZ TESTING MODULES ---
